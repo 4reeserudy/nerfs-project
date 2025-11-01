@@ -23,16 +23,44 @@ class SceneWorkspace:
     colmap_root: Path
     database_path: Path
     reconstruction_dir: Path
+    dense_root: Path
     undistorted_dir: Path
     text_output_dir: Path
+
+
+@dataclass(frozen=True)
+class FeatureExtractionConfig:
+    """Configuration flags for COLMAP feature extraction."""
+
+    use_gpu: bool = True
+    max_image_size: Optional[int] = None
+    camera_model: Optional[str] = None
+    single_camera: bool = False
+
+
+@dataclass(frozen=True)
+class MatchingConfig:
+    """Configuration for COLMAP feature matching."""
+
+    matcher: str = "exhaustive"
+    sequential_overlap: int = 5
 
 
 class ColmapPipeline:
     """High-level orchestrator for running COLMAP pipelines."""
 
-    def __init__(self, data_root: Path, *, colmap_path: str = "colmap") -> None:
+    def __init__(
+        self,
+        data_root: Path,
+        *,
+        colmap_path: str = "colmap",
+        feature_config: FeatureExtractionConfig | None = None,
+        matching_config: MatchingConfig | None = None,
+    ) -> None:
         self.data_root = data_root
         self.colmap_path = colmap_path
+        self.feature_config = feature_config or FeatureExtractionConfig()
+        self.matching_config = matching_config or MatchingConfig()
         self._colmap_checked = False
 
     def run(
@@ -81,14 +109,19 @@ class ColmapPipeline:
                 shutil.rmtree(workspace.reconstruction_dir)
             if workspace.undistorted_dir.exists():
                 shutil.rmtree(workspace.undistorted_dir)
+            if workspace.dense_root.exists():
+                shutil.rmtree(workspace.dense_root)
             if workspace.text_output_dir.exists():
                 shutil.rmtree(workspace.text_output_dir)
 
+        workspace.colmap_root.mkdir(parents=True, exist_ok=True)
+        workspace.dense_root.mkdir(parents=True, exist_ok=True)
         workspace.reconstruction_dir.mkdir(parents=True, exist_ok=True)
 
     def _run_feature_extraction(self, workspace: SceneWorkspace) -> None:
         """Run COLMAP feature extraction for the provided scene."""
         _LOGGER.info("[COLMAP] Feature extraction")
+        cfg = self.feature_config
         command = [
             "feature_extractor",
             "--database_path",
@@ -96,16 +129,36 @@ class ColmapPipeline:
             "--image_path",
             str(workspace.images_dir),
         ]
+        if not cfg.use_gpu:
+            command.extend(["--SiftExtraction.use_gpu", "0"])
+        if cfg.max_image_size is not None:
+            command.extend(["--SiftExtraction.max_image_size", str(cfg.max_image_size)])
+        if cfg.camera_model is not None:
+            command.extend(["--ImageReader.camera_model", cfg.camera_model])
+        if cfg.single_camera:
+            command.extend(["--ImageReader.single_camera", "1"])
         self._run_colmap_command(command)
 
     def _run_feature_matching(self, workspace: SceneWorkspace) -> None:
         """Run COLMAP feature matching for the provided scene."""
-        _LOGGER.info("[COLMAP] Feature matching")
+        cfg = self.matching_config
+        matcher = cfg.matcher.lower()
+        if matcher not in {"exhaustive", "sequential"}:
+            raise ValueError(
+                "Unsupported matcher '%s'. Expected 'exhaustive' or 'sequential'."
+                % cfg.matcher
+            )
+
+        _LOGGER.info("[COLMAP] Feature matching (%s)", matcher)
         command = [
-            "exhaustive_matcher",
+            f"{matcher}_matcher",
             "--database_path",
             str(workspace.database_path),
         ]
+        if matcher == "sequential":
+            command.extend(
+                ["--SequentialMatching.overlap", str(max(cfg.sequential_overlap, 1))]
+            )
         self._run_colmap_command(command)
 
     def _run_sparse_reconstruction(self, workspace: SceneWorkspace) -> None:
@@ -202,7 +255,8 @@ class ColmapPipeline:
             colmap_root=scene_root / "colmap",
             database_path=scene_root / "colmap" / "database.db",
             reconstruction_dir=scene_root / "colmap" / "sparse",
-            undistorted_dir=scene_root / "undistorted",
+            dense_root=scene_root / "dense",
+            undistorted_dir=scene_root / "dense" / "images",
             text_output_dir=scene_root / "sparse",
         )
 
@@ -237,6 +291,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to the COLMAP executable.",
     )
     parser.add_argument(
+        "--feature-no-gpu",
+        action="store_true",
+        help="Disable GPU usage during feature extraction.",
+    )
+    parser.add_argument(
+        "--feature-max-image-size",
+        type=int,
+        default=None,
+        help="Optional maximum image size for SIFT extraction.",
+    )
+    parser.add_argument(
+        "--feature-camera-model",
+        default=None,
+        help="Override the COLMAP camera model (e.g. PINHOLE, SIMPLE_RADIAL).",
+    )
+    parser.add_argument(
+        "--feature-single-camera",
+        action="store_true",
+        help="Force COLMAP to use a shared camera across all images.",
+    )
+    parser.add_argument(
+        "--matcher",
+        choices=("exhaustive", "sequential"),
+        default="exhaustive",
+        help="Feature matcher strategy to use.",
+    )
+    parser.add_argument(
+        "--sequential-overlap",
+        type=int,
+        default=5,
+        help="Number of neighbouring frames to match when using sequential matcher.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging level (e.g. DEBUG, INFO, WARNING).",
@@ -251,7 +338,23 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
 
-    pipeline = ColmapPipeline(args.data_root, colmap_path=args.colmap_path)
+    feature_config = FeatureExtractionConfig(
+        use_gpu=not args.feature_no_gpu,
+        max_image_size=args.feature_max_image_size,
+        camera_model=args.feature_camera_model,
+        single_camera=args.feature_single_camera,
+    )
+    matching_config = MatchingConfig(
+        matcher=args.matcher,
+        sequential_overlap=args.sequential_overlap,
+    )
+
+    pipeline = ColmapPipeline(
+        args.data_root,
+        colmap_path=args.colmap_path,
+        feature_config=feature_config,
+        matching_config=matching_config,
+    )
     pipeline.run(
         args.scene,
         overwrite=args.overwrite,
