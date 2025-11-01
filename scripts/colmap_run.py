@@ -3,39 +3,208 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import shutil
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SceneWorkspace:
+    """Resolved paths used throughout the COLMAP pipeline."""
+
+    scene: str
+    scene_root: Path
+    images_dir: Path
+    colmap_root: Path
+    database_path: Path
+    reconstruction_dir: Path
+    undistorted_dir: Path
+    text_output_dir: Path
 
 
 class ColmapPipeline:
     """High-level orchestrator for running COLMAP pipelines."""
 
-    def __init__(self, data_root: Path) -> None:
+    def __init__(self, data_root: Path, *, colmap_path: str = "colmap") -> None:
         self.data_root = data_root
+        self.colmap_path = colmap_path
+        self._colmap_checked = False
 
-    def run(self, scene: str, *, overwrite: bool = False) -> None:
+    def run(
+        self,
+        scene: str,
+        *,
+        overwrite: bool = False,
+        exports: Optional[Iterable[str]] = None,
+    ) -> None:
         """Execute the full COLMAP sparse reconstruction pipeline."""
-        raise NotImplementedError
+        workspace = self._scene_workspace(scene)
+        exports = tuple(exports or ())
 
-    def _prepare_scene(self, scene: str) -> None:
+        _LOGGER.info("Running COLMAP pipeline for scene '%s'", scene)
+        self._prepare_scene(workspace, overwrite=overwrite)
+        self._run_feature_extraction(workspace)
+        self._run_feature_matching(workspace)
+        self._run_sparse_reconstruction(workspace)
+
+        if exports:
+            self._export_results(workspace, exports)
+
+    def _prepare_scene(self, workspace: SceneWorkspace, *, overwrite: bool) -> None:
         """Validate input scene assets and prepare workspace."""
-        raise NotImplementedError
+        if not workspace.scene_root.exists():
+            raise FileNotFoundError(
+                f"Scene '{workspace.scene}' not found under {self.data_root}."
+            )
 
-    def _run_feature_extraction(self, scene: str) -> None:
+        if not workspace.images_dir.exists():
+            raise FileNotFoundError(
+                f"Scene '{workspace.scene}' is missing an images/ directory."
+            )
+
+        if not any(workspace.images_dir.iterdir()):
+            raise RuntimeError(
+                f"Scene '{workspace.scene}' has no images to process in {workspace.images_dir}."
+            )
+
+        workspace.colmap_root.mkdir(parents=True, exist_ok=True)
+
+        if overwrite:
+            if workspace.database_path.exists():
+                workspace.database_path.unlink()
+            if workspace.reconstruction_dir.exists():
+                shutil.rmtree(workspace.reconstruction_dir)
+            if workspace.undistorted_dir.exists():
+                shutil.rmtree(workspace.undistorted_dir)
+            if workspace.text_output_dir.exists():
+                shutil.rmtree(workspace.text_output_dir)
+
+        workspace.reconstruction_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_feature_extraction(self, workspace: SceneWorkspace) -> None:
         """Run COLMAP feature extraction for the provided scene."""
-        raise NotImplementedError
+        _LOGGER.info("[COLMAP] Feature extraction")
+        command = [
+            "feature_extractor",
+            "--database_path",
+            str(workspace.database_path),
+            "--image_path",
+            str(workspace.images_dir),
+        ]
+        self._run_colmap_command(command)
 
-    def _run_feature_matching(self, scene: str) -> None:
+    def _run_feature_matching(self, workspace: SceneWorkspace) -> None:
         """Run COLMAP feature matching for the provided scene."""
-        raise NotImplementedError
+        _LOGGER.info("[COLMAP] Feature matching")
+        command = [
+            "exhaustive_matcher",
+            "--database_path",
+            str(workspace.database_path),
+        ]
+        self._run_colmap_command(command)
 
-    def _run_sparse_reconstruction(self, scene: str) -> None:
+    def _run_sparse_reconstruction(self, workspace: SceneWorkspace) -> None:
         """Execute sparse reconstruction and bundle adjustment."""
-        raise NotImplementedError
+        _LOGGER.info("[COLMAP] Sparse reconstruction")
+        command = [
+            "mapper",
+            "--database_path",
+            str(workspace.database_path),
+            "--image_path",
+            str(workspace.images_dir),
+            "--output_path",
+            str(workspace.reconstruction_dir),
+        ]
+        self._run_colmap_command(command)
 
-    def _export_results(self, scene: str, outputs: Iterable[str]) -> None:
+    def _export_results(
+        self, workspace: SceneWorkspace, outputs: Iterable[str]
+    ) -> None:
         """Export COLMAP outputs for downstream NeRF consumption."""
-        raise NotImplementedError
+        export_set = {output.lower() for output in outputs}
+        model_dir = self._locate_model_dir(workspace.reconstruction_dir)
+
+        if {"sparse", "text"} & export_set:
+            _LOGGER.info("[COLMAP] Exporting sparse model to text format")
+            workspace.text_output_dir.mkdir(parents=True, exist_ok=True)
+            command = [
+                "model_converter",
+                "--input_path",
+                str(model_dir),
+                "--output_path",
+                str(workspace.text_output_dir),
+                "--output_type",
+                "TXT",
+            ]
+            self._run_colmap_command(command)
+
+        if "images" in export_set:
+            _LOGGER.info("[COLMAP] Undistorting images")
+            workspace.undistorted_dir.mkdir(parents=True, exist_ok=True)
+            command = [
+                "image_undistorter",
+                "--image_path",
+                str(workspace.images_dir),
+                "--input_path",
+                str(model_dir),
+                "--output_path",
+                str(workspace.undistorted_dir),
+                "--output_type",
+                "COLMAP",
+            ]
+            self._run_colmap_command(command)
+
+    def _run_colmap_command(self, command: Sequence[str]) -> None:
+        """Run a COLMAP subcommand, ensuring the binary exists."""
+        self._ensure_colmap_available()
+        full_command = [self.colmap_path, *command]
+        _LOGGER.debug("Executing command: %s", " ".join(full_command))
+        subprocess.run(full_command, check=True)
+
+    def _ensure_colmap_available(self) -> None:
+        if self._colmap_checked:
+            return
+        if shutil.which(self.colmap_path) is None:
+            raise FileNotFoundError(
+                f"COLMAP executable '{self.colmap_path}' not found in PATH. "
+                "Provide the correct path with --colmap-path."
+            )
+        self._colmap_checked = True
+
+    def _locate_model_dir(self, reconstruction_dir: Path) -> Path:
+        """Locate the COLMAP sparse model directory within the workspace."""
+        direct_model = reconstruction_dir / "cameras.bin"
+        if direct_model.exists():
+            return reconstruction_dir
+
+        candidates = sorted(p for p in reconstruction_dir.iterdir() if p.is_dir())
+        for candidate in candidates:
+            if (candidate / "cameras.bin").exists():
+                return candidate
+
+        raise FileNotFoundError(
+            "No COLMAP model was found after reconstruction. Expected cameras.bin "
+            f"under {reconstruction_dir}."
+        )
+
+    def _scene_workspace(self, scene: str) -> SceneWorkspace:
+        """Resolve workspace paths for the requested scene."""
+        scene_root = self.data_root / scene
+        return SceneWorkspace(
+            scene=scene,
+            scene_root=scene_root,
+            images_dir=scene_root / "images",
+            colmap_root=scene_root / "colmap",
+            database_path=scene_root / "colmap" / "database.db",
+            reconstruction_dir=scene_root / "colmap" / "sparse",
+            undistorted_dir=scene_root / "undistorted",
+            text_output_dir=scene_root / "sparse",
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -57,14 +226,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--exports",
         nargs="*",
         default=("sparse", "images"),
-        help="Subset of COLMAP outputs to export.",
+        help=(
+            "Subset of COLMAP outputs to export (choices: sparse, text, images). "
+            "Defaults to sparse and images."
+        ),
+    )
+    parser.add_argument(
+        "--colmap-path",
+        default="colmap",
+        help="Path to the COLMAP executable.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (e.g. DEBUG, INFO, WARNING).",
     )
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     """CLI entry point for the COLMAP pipeline script."""
-    raise NotImplementedError
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s: %(message)s")
+
+    pipeline = ColmapPipeline(args.data_root, colmap_path=args.colmap_path)
+    pipeline.run(
+        args.scene,
+        overwrite=args.overwrite,
+        exports=args.exports,
+    )
 
 
 if __name__ == "__main__":
