@@ -3,6 +3,7 @@ import numpy as np
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+from PIL import Image
 from typing import Tuple, Iterable, Optional
 import torch
 
@@ -126,32 +127,65 @@ class PixelBatcher:
 @dataclass
 class Learn2DDataset:
     """
-    Thin container for a single image’s pixel field.
+    Thin container for one image’s pixel field.
     """
     H: int
     W: int
-    coords: torch.Tensor     # (N, 2), float32 in [0,1]
-    colors: torch.Tensor     # (N, 3), float32 in [0,1]
-    train_idx: torch.Tensor  # (N_train,)
-    val_idx: torch.Tensor    # (N_val,)
+    coords: torch.Tensor     # (N, 2), float32 in [0,1], on CPU
+    colors: torch.Tensor     # (N, 3), float32 in [0,1], on CPU
+    train_idx: torch.Tensor  # (N_train,), long on CPU
+    val_idx: torch.Tensor    # (N_val,), long on CPU
 
-    def train_loader(self, batch_size: int = 10_000, shuffle: bool = True, seed: Optional[int] = None) -> PixelBatcher:
+    def train_loader(
+        self,
+        batch_size: int = 10_000,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ) -> "PixelBatcher":
         """
-        Return a PixelBatcher over train indices.
+        Return a PixelBatcher over training indices.
         """
-        raise NotImplementedError
+        return PixelBatcher(
+            coords=self.coords,
+            colors=self.colors,
+            idxs=self.train_idx,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            seed=seed,
+        )
 
     def val_full(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Return full validation tensors: (coords_val, colors_val).
         """
-        raise NotImplementedError
+        return self.coords[self.val_idx], self.colors[self.val_idx]
 
 
-# ---------- Convenience ----------
-
-def load_dataset(path: Path, val_frac: float = 0.05, seed: int = 0) -> Learn2DDataset:
+def load_dataset(
+    path: Path,
+    val_frac: float = 0.05,
+    seed: int = 0,
+) -> Learn2DDataset:
     """
     Compose: load_image_rgb -> make_coords -> flatten_colors -> split_indices -> Learn2DDataset.
+    Prints a one-line summary of shapes/splits.
     """
-    raise NotImplementedError
+    img_rgb, H, W = load_image_rgb(path)          # (H, W, 3) float32 in [0,1]
+    coords = make_coords(H, W)                    # (N, 2)
+    colors = flatten_colors(img_rgb)              # (N, 3)
+    N = H * W
+    train_idx, val_idx = split_indices(N, val_frac=val_frac, seed=seed)
+
+    ds = Learn2DDataset(
+        H=H,
+        W=W,
+        coords=coords,
+        colors=colors,
+        train_idx=train_idx,
+        val_idx=val_idx,
+    )
+
+    # One-line summary (minimal, helpful)
+    print(f"[learn2d] {path.name}: HxW={H}x{W}, N={N}, train={len(train_idx)}, val={len(val_idx)}")
+
+    return ds
