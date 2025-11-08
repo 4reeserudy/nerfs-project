@@ -48,6 +48,7 @@ def parse_args() -> Any:
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--snap_epochs", type=str, default="10,100,300,1000")  # keep as string; parse later
     p.add_argument("--save_dir", type=Path, default=Path("results/learn2d"))
+    p.add_argument("--tag", type=str, default="", help="Optional suffix for run folder name (e.g., 'v2', 'rand', 'seed3').")
     return p.parse_args()
 
 
@@ -71,10 +72,13 @@ def setup_device(device_str: str | None = None) -> torch.device:
     return device
 
 
-def setup_run_dir(image_path: Path, L: int, W: int, seed: int, save_root: Path) -> Path:
+def setup_run_dir(image_path: Path, L: int, W: int, seed: int, save_root: Path, tag: str = "") -> Path:
     # no seed in folder name
     img_stem = image_path.stem
-    run_dir = save_root / img_stem / f"L{L}_W{W}"
+    run_name = f"L{L}_W{W}"
+    if tag:
+        run_name = f"{run_name}_{tag}"
+    run_dir = save_root / img_stem / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[RunDir] {run_dir}")
     return run_dir
@@ -324,7 +328,7 @@ def main():
 
     # ---------------- Setup ----------------
     device = setup_device(args.device)
-    run_dir = setup_run_dir(args.image_path, args.L, args.W, args.seed, args.save_dir)
+    run_dir = setup_run_dir(args.image_path, args.L, args.W, args.seed, args.save_dir, args.tag)
 
     img, H, W = load_image_rgb(Path(args.image_path))  # your helper returns (img, H, W)
 
