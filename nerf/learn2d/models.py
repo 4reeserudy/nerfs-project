@@ -39,6 +39,7 @@ class ImageMLPReLU(nn.Module):
 
         def _init(m):
             import torch.nn.init as I
+            import torch.nn as nn
             if isinstance(m, nn.Linear):
                 I.xavier_uniform_(m.weight, gain=1.0)
                 I.zeros_(m.bias)
