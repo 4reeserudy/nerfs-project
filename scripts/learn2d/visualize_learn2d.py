@@ -42,7 +42,7 @@ def generate_progress_grids():
         out = run / "progress_grid.png"
         print(f"[Progress] {run.name} → {out.name}")
         make_progress_grid_by_epoch(
-            run_path=run,
+            run_dir=run,
             epochs=SNAP_EPOCHS,
             out_path=out,
             include_final=True,
