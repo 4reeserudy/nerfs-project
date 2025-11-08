@@ -25,11 +25,6 @@ RUNS = [
     Path("results/learn2d/fox/L10_W128_v2"),
     Path("results/learn2d/fox/L10_W512_v2"),
 ]
-RUNS = [
-    Path("results/learn2d/fox/L4_W512_v2"),
-    Path("results/learn2d/fox/L10_W128_v2"),
-    Path("results/learn2d/fox/L10_W512_v2")
-]
 
 # Epoch checkpoints you saved for snapshots
 SNAP_EPOCHS = [10, 300, 1000]
@@ -115,9 +110,9 @@ def plot_psnr_curves():
 # ============================================================
 
 def main():
-    generate_progress_grids()
-    # compare_finals()
-    plot_psnr_curves()
+    # generate_progress_grids()
+    compare_finals()
+    # plot_psnr_curves()
 
 
 if __name__ == "__main__":
