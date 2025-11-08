@@ -8,7 +8,7 @@ import json
 import torch
 
 # local imports (assumed present)
-from nerf.learn2d.dataset import load_dataset, PixelBatcher, make_coords, load_image_rgb, split_indices
+from nerf.learn2d.dataset import PixelBatcher, make_coords, load_image_rgb, split_indices
 from nerf.learn2d.pe import fourier_encode, output_dim
 from nerf.learn2d.models import make_mlp_relu
 from nerf.learn2d.losses import mse, psnr

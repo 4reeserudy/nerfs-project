@@ -1,10 +1,11 @@
-# nerf/learn2d/dataset.py
-import numpy as np
 from __future__ import annotations
-from dataclasses import dataclass
+
+import numpy as np
+import torch
 from pathlib import Path
 from PIL import Image
-from typing import Tuple, Iterable, Optional
+from dataclasses import dataclass
+from typing import Tuple, Optional
 import torch
 
 
