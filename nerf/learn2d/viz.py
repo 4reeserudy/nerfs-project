@@ -274,12 +274,21 @@ def _draw_label(tile: Image.Image, text: str) -> Image.Image:
         font = ImageFont.truetype("DejaVuSans.ttf", 18)
     except Exception:
         font = ImageFont.load_default()
-    tw, th = draw.textsize(text, font=font)
+
+    # Get text size (compatible with all Pillow versions)
+    try:
+        # Pillow ≥ 8.0
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        # Fallback for older Pillow
+        tw, th = draw.textsize(text, font=font)
+
     w, h = img.size
     pad = 8
-    box = [w // 2 - tw // 2 - pad, h - th - 2 * pad, w // 2 + tw // 2 + pad, h - pad]
+    box = [w//2 - tw//2 - pad, h - th - 2*pad, w//2 + tw//2 + pad, h - pad]
     draw.rectangle(box, fill=(0, 0, 0))
-    draw.text((w // 2 - tw // 2, h - th - pad - 1), text, fill=(255, 255, 255), font=font)
+    draw.text((w//2 - tw//2, h - th - pad - 1), text, fill=(255, 255, 255), font=font)
     return img
 
 def _draw_label_on_canvas(
