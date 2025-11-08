@@ -55,7 +55,7 @@ def compare_finals():
     image_paths = [r / "recon_final.png" for r in RUNS]
     labels = [r.name for r in RUNS]   # shorter labels
 
-    out = Path("results/learn2d/fox/finals_compare_v2.png")
+    out = Path("results/learn2d/hammock/finals_compare.png")
     tile_images_with_labels(
         image_paths=image_paths,
         labels=labels,
