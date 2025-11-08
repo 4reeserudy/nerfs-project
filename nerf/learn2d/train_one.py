@@ -3,11 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import argparse
+import json
 
 import torch
 
 # local imports (assumed present)
-from nerf.learn2d.dataset import load_dataset, PixelBatcher, make_coords
+from nerf.learn2d.dataset import load_dataset, PixelBatcher, make_coords, load_image_rgb, split_indices
 from nerf.learn2d.pe import fourier_encode, output_dim
 from nerf.learn2d.models import make_mlp_relu
 from nerf.learn2d.losses import mse, psnr
@@ -70,15 +71,10 @@ def setup_device(device_str: str | None = None) -> torch.device:
     return device
 
 
-def setup_run_dir(
-    image_path: Path, L: int, W: int, seed: int, save_root: Path
-) -> Path:
-    """
-    Build a unique directory for this training run:
-      e.g., results/learn2d/fox/L4_W128_seed0/
-    """
+def setup_run_dir(image_path: Path, L: int, W: int, seed: int, save_root: Path) -> Path:
+    # no seed in folder name
     img_stem = image_path.stem
-    run_dir = save_root / img_stem / f"L{L}_W{W}_seed{seed}"
+    run_dir = save_root / img_stem / f"L{L}_W{W}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[RunDir] {run_dir}")
     return run_dir
@@ -311,18 +307,12 @@ def train_loop(
 
 # -------------- Logging ---------------
 
-def save_run_log(run_dir: Path, config: Dict[str, Any], final_psnr: float) -> None:
-    """
-    Save a JSON log of this training run.
-    Includes config hyperparameters + final PSNR score.
-    """
-    log = {
-        "config": config,
-        "final_psnr": float(final_psnr),
-    }
+def save_run_log(run_dir: Path, run_log: Dict[str, Any]) -> None:
     out_path = run_dir / "run_log.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        json.dump(log, f, indent=2)
+        json.dump(run_log, f, indent=2)
+
 
 
 # -------------- Main ------------------
@@ -330,13 +320,14 @@ def save_run_log(run_dir: Path, config: Dict[str, Any], final_psnr: float) -> No
 def main():
     # ---------------- Parse CLI ----------------
     args = parse_args()
+    snaps = [int(s) for s in args.snap_epochs.split(",") if s.strip()]
 
     # ---------------- Setup ----------------
-    device = setup_device()
-    run_dir = setup_run_dir(Path(args.out_dir), args.image, args.L, args.W, args.seed)
+    device = setup_device(args.device)
+    run_dir = setup_run_dir(args.image_path, args.L, args.W, args.seed, args.save_dir)
 
     # Load data
-    coords, colors, H, W = load_image_rgb(Path(f"data/learn2d/{args.image}"))
+    coords, colors, H, W = load_image_rgb(Path(f"data/learn2d/{args.image_path}"))
     coords, colors = coords.to("cpu"), colors.to("cpu")  # keep master copy CPU
 
     # Split
@@ -364,7 +355,7 @@ def main():
         iters=args.iters,
         batch_size=args.batch_size,
         log_every=args.log_every,
-        snap_epochs=[args.iters // 4, args.iters // 2, 3 * args.iters // 4],
+        snap_epochs=snaps,
         run_dir=run_dir,
         device=device,
         amp=args.amp,
