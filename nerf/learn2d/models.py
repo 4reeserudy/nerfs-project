@@ -37,6 +37,18 @@ class ImageMLPReLU(nn.Module):
             nn.Sigmoid(),
         )
 
+        def _init(m):
+            import torch.nn.init as I
+            if isinstance(m, nn.Linear):
+                I.xavier_uniform_(m.weight, gain=1.0)
+                I.zeros_(m.bias)
+
+        self.net.apply(_init)
+
+        # BREAK SYMMETRY AT OUTPUT: random bias so sigmoid ≠ 0.5 everywhere
+        last = self.net[-1]                    # nn.Linear(..., 3)
+        nn.init.uniform_(last.bias, -2.0, 2.0) # pushes sigmoid to diverse colors
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
