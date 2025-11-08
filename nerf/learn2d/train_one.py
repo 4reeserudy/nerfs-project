@@ -355,7 +355,8 @@ def main():
     colors_val = colors[val_idx]
 
     # ---------------- Build Model & Optimizer ----------------
-    model = build_model(args.L, args.W, device)
+    in_dim = 2 + 4 * args.L
+    model = build_model(in_dim, args.W, device)
     optimizer = build_optimizer(model, args.lr)
 
     # ---------------- Train ----------------
