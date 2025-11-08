@@ -115,7 +115,7 @@ def plot_psnr_curves():
 def main():
     generate_progress_grids()
     # compare_finals()
-    # plot_psnr_curves()
+    plot_psnr_curves()
 
 
 if __name__ == "__main__":
