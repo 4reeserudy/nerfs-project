@@ -26,7 +26,9 @@ RUNS = [
     Path("results/learn2d/fox/L10_W512_v2"),
 ]
 RUNS = [
-    Path("results/learn2d/fox/L4_W128_v2")
+    Path("results/learn2d/fox/L4_W512_v2"),
+    Path("results/learn2d/fox/L10_W128_v2"),
+    Path("results/learn2d/fox/L10_W512_v2")
 ]
 
 # Epoch checkpoints you saved for snapshots
