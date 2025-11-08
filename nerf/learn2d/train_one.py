@@ -8,7 +8,7 @@ import json
 import torch
 
 # local imports (assumed present)
-from nerf.learn2d.dataset import PixelBatcher, make_coords, load_image_rgb, split_indices
+from nerf.learn2d.dataset import PixelBatcher, make_coords, load_image_rgb, split_indices, flatten_colors
 from nerf.learn2d.pe import fourier_encode, output_dim
 from nerf.learn2d.models import make_mlp_relu
 from nerf.learn2d.losses import mse, psnr
@@ -327,7 +327,11 @@ def main():
     run_dir = setup_run_dir(args.image_path, args.L, args.W, args.seed, args.save_dir)
 
     # Load data
-    coords, colors, H, W = load_image_rgb(Path(f"data/learn2d/{args.image_path}"))
+    img = load_image_rgb(Path(args.image_path))   # tensor or np → your helper handles it
+    H, W = int(img.shape[0]), int(img.shape[1])
+
+    coords = make_coords(H, W)        # (H*W, 2) in [0,1]
+    colors = flatten_colors(img)      # (H*W, 3) in [0,1]
     coords, colors = coords.to("cpu"), colors.to("cpu")  # keep master copy CPU
 
     # Split
