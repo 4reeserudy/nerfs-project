@@ -326,9 +326,22 @@ def main():
     device = setup_device(args.device)
     run_dir = setup_run_dir(args.image_path, args.L, args.W, args.seed, args.save_dir)
 
-    # Load data
-    img = load_image_rgb(Path(args.image_path))   # tensor or np → your helper handles it
-    H, W = int(img.shape[0]), int(img.shape[1])
+    img, H, W = load_image_rgb(Path(args.image_path))  # your helper returns (img, H, W)
+
+    # ensure tensor in [0,1] for downstream
+    import torch
+    if isinstance(img, tuple):
+        raise RuntimeError("load_image_rgb returned unexpected nested tuple.")
+    if not torch.is_tensor(img):
+        # assume numpy uint8 HxWx3 → tensor float in [0,1]
+        import numpy as np
+        if isinstance(img, np.ndarray) and img.dtype == np.uint8:
+            img = torch.from_numpy(img).float() / 255.0
+        else:
+            # last-resort: try to convert generically
+            img = torch.as_tensor(img).float()
+            if img.max() > 1.0:
+                img = img / 255.0  # best-effort normalize
 
     coords = make_coords(H, W)        # (H*W, 2) in [0,1]
     colors = flatten_colors(img)      # (H*W, 3) in [0,1]
