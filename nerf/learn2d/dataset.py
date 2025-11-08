@@ -64,9 +64,23 @@ def split_indices(N: int, val_frac: float = 0.05, seed: int = 0) -> Tuple[torch.
 
 def split_indices(N: int, val_frac: float = 0.05, seed: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Return: (train_idx, val_idx) as 1D LongTensors, disjoint.
+    Return (train_idx, val_idx) as torch.long tensors.
+    Ensures both splits are non-empty when possible.
     """
-    raise NotImplementedError
+    if N <= 1:
+        raise ValueError(f"N must be > 1, got {N}")
+
+    # clamp val fraction to [0.0, 0.9] to avoid degenerate splits
+    vf = float(max(0.0, min(val_frac, 0.9)))
+    n_val = int(round(vf * N))
+    n_val = max(1, min(N - 1, n_val))  # ensure at least 1 val and 1 train
+
+    g = torch.Generator().manual_seed(int(seed))
+    perm = torch.randperm(N, generator=g)
+
+    val_idx = perm[:n_val].to(torch.long)
+    train_idx = perm[n_val:].to(torch.long)
+    return train_idx, val_idx
 
 
 # ---------- Batching ----------
