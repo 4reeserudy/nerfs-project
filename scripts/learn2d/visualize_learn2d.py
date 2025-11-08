@@ -32,7 +32,7 @@ RUNS = [
 ]
 
 # Epoch checkpoints you saved for snapshots
-SNAP_EPOCHS = [10, 100, 500]
+SNAP_EPOCHS = [10, 300, 1000]
 
 
 # ============================================================
