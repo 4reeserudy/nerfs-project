@@ -296,19 +296,29 @@ def _draw_label_on_canvas(
     text: str,
     x: int,
     y: int,
-    slot_w: int,
-    band_h: int,
-    color: Tuple[int, int, int],
+    w: int,
+    h: int,
+    color: Tuple[int, int, int] = (255, 255, 255),
 ) -> None:
+    """Draw a centered label into a row below each tile."""
     draw = ImageDraw.Draw(canvas)
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
     except Exception:
         font = ImageFont.load_default()
-    tw, th = draw.textsize(text, font=font)
-    tx = x + (slot_w - tw) // 2
-    ty = y + max(2, (band_h - th) // 2)
-    draw.text((tx, ty), text, fill=color, font=font)
+
+    # Compute text size with Pillow ≥8 or fallback
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        tw, th = draw.textsize(text, font=font)
+
+    pad = 6
+    box = [x + w//2 - tw//2 - pad, y, x + w//2 + tw//2 + pad, y + th + 2*pad]
+    draw.rectangle(box, fill=(0, 0, 0))
+    draw.text((x + w//2 - tw//2, y + pad), text, font=font, fill=color)
+
 
 def _compose_row_grid(
     tiles: List[Image.Image],
