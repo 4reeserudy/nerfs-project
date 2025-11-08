@@ -348,7 +348,7 @@ def main():
     coords, colors = coords.to("cpu"), colors.to("cpu")  # keep master copy CPU
 
     # Split
-    train_idx, val_idx = split_indices(len(coords), args.train_frac, args.seed)
+    train_idx, val_idx = split_indices(len(coords), args.val_frac, args.seed)
     train_idx = train_idx.to("cpu")
     val_idx = val_idx.to("cpu")
     coords_val = coords[val_idx]
