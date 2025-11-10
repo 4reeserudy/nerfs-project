@@ -50,53 +50,67 @@ def pixel_to_cam_dir(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Back-project pixel(s) to unit direction(s) in CAMERA space.
-
-    Inputs:
-      - K:  (..., 3, 3) intrinsics (shared or per-image); supports batching.
-      - uv: (..., 2)    pixel coords (u, v) in pixels.
-      - pixel_center:   if True, shift by +0.5 for center-of-pixel rays.
-      - eps:            small epsilon for norm stability.
-
-    Returns:
-      - d_c: (..., 3) unit direction(s) in camera coordinates.
-
-    Flow:
-      1) If pixel_center: uv = uv + (0.5, 0.5).
-      2) Form homogeneous pixel p = [u, v, 1].
-      3) x_c ∝ K^{-1} p. (Use batched-safe solve/inverse.)
-      4) Normalize to unit length -> d_c.
-      5) Convention guard: we assume OpenGL camera (forward -Z). We keep as-is;
-         any dataset flip will be handled by a separate convention utility (later if needed).
+    K:  (...,3,3) intrinsics (can be shared or per-item)
+    uv: (...,2)   pixel coords (u,v) in pixels
+    ->  d_c: (...,3) unit camera-space directions
     """
-    # TODO: implement
-    raise NotImplementedError
+    if uv.shape[-1] != 2 or K.shape[-2:] != (3, 3):
+        raise ValueError(f"bad shapes: K{K.shape}, uv{uv.shape}")
+
+    # dtype/device harmonization
+    uv = uv.to(device=K.device, dtype=K.dtype)
+
+    # center-of-pixel shift
+    if pixel_center:
+        uv = uv + 0.5
+
+    # homogeneous pixel
+    ones = torch.ones_like(uv[..., :1])
+    p = torch.cat([uv, ones], dim=-1)                     # (...,3)
+
+    # broadcast K to match leading dims of p if needed
+    if K.dim() == 2:
+        K = K.expand(p.shape[:-1] + (3, 3))               # (...,3,3)
+
+    # solve K * x = p  (avoid explicit inverse)
+    x = torch.linalg.solve(K, p[..., None]).squeeze(-1)   # (...,3)
+
+    # normalize to unit length
+    n = torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(torch.as_tensor(eps, dtype=K.dtype, device=K.device))
+    d_c = x / n
+    return d_c
 
 
 def cam_to_world_ray(
-    T_c2w: torch.Tensor,
-    d_c: torch.Tensor,
+    T_c2w: torch.Tensor,   # (...,4,4)
+    d_c: torch.Tensor,     # (...,3)
     normalize: bool = True,
     eps: float = 1e-8,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Transform camera-space ray direction(s) to world space.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if T_c2w.shape[-2:] != (4, 4) or d_c.shape[-1] != 3:
+        raise ValueError(f"bad shapes: T{T_c2w.shape}, d_c{d_c.shape}")
+    R = T_c2w[..., :3, :3]
+    t = T_c2w[..., :3, 3]
+    d_c = d_c.to(dtype=R.dtype, device=R.device)
 
-    Inputs:
-      - T_c2w: (..., 4, 4) camera-to-world transform(s)
-      - d_c:   (..., 3)    camera-space direction(s) (ideally unit)
-      - normalize:         if True, re-normalize world directions
-      - eps:               epsilon for norm
+    # d_w = R @ d_c
+    d_w = (R @ d_c[..., None]).squeeze(-1)
+    if normalize:
+        n = torch.linalg.norm(d_w, dim=-1, keepdim=True).clamp_min(torch.as_tensor(eps, dtype=R.dtype, device=R.device))
+        d_w = d_w / n
+    o_w = t
+    return o_w, d_w
 
-    Returns:
-      - o_w: (..., 3)  world-space ray origin(s)  (o_w = translation part of T_c2w)
-      - d_w: (..., 3)  world-space ray direction(s)
 
-    Flow:
-      1) Extract R = T_c2w[..., :3, :3], t = T_c2w[..., :3, 3].
-      2) o_w = t (origin at camera center in world).
-      3) d_w = R @ d_c (pure rotation on direction).
-      4) If normalize: d_w = d_w / ||d_w||.
-    """
-    # TODO: implement
-    raise NotImplementedError
+def pixel_to_ray(
+    K: torch.Tensor,        # (...,3,3)
+    T_c2w: torch.Tensor,    # (...,4,4)
+    uv: torch.Tensor,       # (...,2)
+    pixel_center: bool = True,
+    normalize: bool = True,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .pixels_to_rays import pixel_to_cam_dir  # local import to avoid cycles if split
+    d_c = pixel_to_cam_dir(K, uv, pixel_center=pixel_center, eps=eps)
+    o_w, d_w = cam_to_world_ray(T_c2w, d_c, normalize=normalize, eps=eps)
+    return o_w, d_w
