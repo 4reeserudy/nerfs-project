@@ -130,12 +130,16 @@ def maybe_snapshot(model, step: int, cfg: Dict[str, Any], device: torch.device, 
 
 # ------------------------------ validate --------------------------------
 
+from itertools import islice
+
 @torch.no_grad()
-def validate(model: NeRFMLP, loader, cfg: Dict[str, Any], device: torch.device) -> Dict[str, float]:
+def validate(model: NeRFMLP, val_loader, cfg: Dict[str, Any], device: torch.device) -> Dict[str, float]:
     """
-    Supports batches in either format:
-      A) {"origins","dirs","rgb", ...}
-      B) {"rays": {"o"/"origins","d"/"dirs"}, "rgb": ...}
+    Finite validation over the *validation* loader only.
+
+    Controls:
+      --val_batches N   (default 8): evaluate at most N batches from val_loader
+      --val_rays M      (default None): optional hard cap on number of rays total
     """
     model.eval()
     n_samples = int(cfg.get("n_samples", 64))
@@ -143,39 +147,58 @@ def validate(model: NeRFMLP, loader, cfg: Dict[str, Any], device: torch.device) 
     chunk = int(cfg.get("chunk", 8192))
     amp = bool(cfg.get("amp", False)) and device.type == "cuda"
 
-    total_mse, total_psnr, total = 0.0, 0.0, 0
+    max_batches = int(cfg.get("val_batches", 8))
+    ray_budget = cfg.get("val_rays", None)
+    ray_budget = int(ray_budget) if ray_budget is not None else None
 
-    for batch in loader:
-        # ---- unify batch format (reuse the same logic as training) ----
+    total_mse, total_psnr, seen_rays = 0.0, 0.0, 0
+    used_batches = 0
+
+    # iterate ONLY over val_loader (which was built from the val split)
+    for batch in islice(val_loader, max_batches):
+        # batch format normalization
         if "rays" in batch:
             rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
             rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
             rgb_gt = batch.get("rgb", None)
         else:
-            rays_o = batch["origins"]
-            rays_d = batch["dirs"]
-            rgb_gt = batch.get("rgb", None)
+            rays_o = batch["origins"]; rays_d = batch["dirs"]; rgb_gt = batch.get("rgb", None)
 
-        rays = {
-            "o": rays_o.to(device, non_blocking=True),
-            "d": rays_d.to(device, non_blocking=True),
-        }
-        rgb_gt = rgb_gt.to(device, non_blocking=True) if torch.is_tensor(rgb_gt) else None
+        rays_o = rays_o.to(device, non_blocking=True)
+        rays_d = rays_d.to(device, non_blocking=True)
+        rgb_gt = rgb_gt.to(device, non_blocking=True)
+
+        # ray budget enforcement (optional)
+        B = rays_o.shape[0]
+        take = B if (ray_budget is None) else min(B, ray_budget - seen_rays)
+        if take <= 0:
+            break
+
+        sub = {"o": rays_o[:take], "d": rays_d[:take]}
+        sub_gt = rgb_gt[:take]
 
         with torch.cuda.amp.autocast(enabled=amp):
+            # validation: no perturbation, black bg (or set via cfg)
             rgb_pred, _depth, _ = forward_batch(
-                model, rays, n_samples, near, far,
+                model, sub, n_samples, near, far,
                 perturb=False, bg_color=0.0, chunk=chunk, amp=amp
             )
-            mse = torch.mean((rgb_pred - rgb_gt) ** 2)
+            mse = torch.mean((rgb_pred - sub_gt) ** 2)
 
-        total_mse  += float(mse.item())
+        total_mse += float(mse.item())
         total_psnr += float(psnr(mse).item())
-        total      += 1
+        seen_rays += take
+        used_batches += 1
 
+        if ray_budget is not None and seen_rays >= ray_budget:
+            break
+
+    used_batches = max(used_batches, 1)
     return {
-        "val_mse":  total_mse / max(total, 1),
-        "val_psnr": total_psnr / max(total, 1),
+        "val_mse":  total_mse / used_batches,
+        "val_psnr": total_psnr / used_batches,
+        "val_rays": seen_rays,
+        "val_batches": used_batches,
     }
 
 # ------------------------------- main loop ------------------------------
