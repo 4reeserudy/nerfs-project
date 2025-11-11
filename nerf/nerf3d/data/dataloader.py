@@ -403,7 +403,6 @@ def make_loaders(
     npz_path: str,
     batch_size: int = 4096,
     policy: str = "global",             # or "per_image"
-    split: str = "train",
     device: Optional[torch.device] = None,
     seed: Optional[int] = None,
     num_workers: int = 0,
@@ -412,10 +411,16 @@ def make_loaders(
     near: Optional[float] = None,
     far: Optional[float] = None,
     pixel_center: bool = True,
-) -> Tuple[torch.utils.data.DataLoader, Dict[str, Any]]:
+    return_scene: bool = False,
+) -> Tuple[torch.utils.data.DataLoader,
+           torch.utils.data.DataLoader,
+           Optional[Dict[str, Any]]]:
     """
-    seed -> scene -> dataset -> dataloader.
-    Returns (loader, scene_meta).
+    Build TRAIN and VAL loaders from a single NPZ dataset and (optionally) return
+    a small 'scene' dict for snapshot anchoring (images_val, c2ws_val, focal).
+
+    Returns:
+        train_loader, val_loader, scene_or_none
     """
     seed_everything(seed)
 
@@ -423,15 +428,15 @@ def make_loaders(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    scene, meta = make_scene_from_npz(
+    # --- Build TRAIN scene/dataset/loader ---
+    train_scene, _train_meta = make_scene_from_npz(
         npz_path=npz_path,
-        split=split,
+        split="train",
         near=near,
         far=far,
     )
-
-    dataset = make_iterable_dataset(
-        scene=scene,
+    train_dataset = make_iterable_dataset(
+        scene=train_scene,
         policy=policy,
         batch_size=batch_size,
         device=device,
@@ -439,12 +444,44 @@ def make_loaders(
         choose_M=choose_M,
         pixel_center=pixel_center,
     )
-
-    loader = make_loader(
-        dataset=dataset,
+    train_loader = make_loader(
+        dataset=train_dataset,
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=2,
     )
 
-    return loader, meta
+    # --- Build VAL scene/dataset/loader ---
+    val_scene, _val_meta = make_scene_from_npz(
+        npz_path=npz_path,
+        split="val",
+        near=near,
+        far=far,
+    )
+    # For val, we typically want deterministic sampling; keep policy global
+    val_dataset = make_iterable_dataset(
+        scene=val_scene,
+        policy="global",
+        batch_size=batch_size,
+        device=device,
+        seed=seed,
+        choose_M=None,           # sample across all images
+        pixel_center=True,       # exact pixel centers for eval
+    )
+    val_loader = make_loader(
+        dataset=val_dataset,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=2,
+    )
+
+    # Minimal 'scene' bundle for snapshot anchoring (used by train_nerf.create_snapshot_anchor)
+    scene_bundle = None
+    if return_scene:
+        scene_bundle = {
+            "images_val": val_scene["images"],  # (Nv, H, W, 3) float32 in [0,1]
+            "c2ws_val":  val_scene["c2ws"],     # (Nv, 4, 4)
+            "focal":     float(val_scene["focal"]),
+        }
+
+    return train_loader, val_loader, scene_bundle
