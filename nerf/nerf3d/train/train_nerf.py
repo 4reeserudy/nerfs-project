@@ -88,12 +88,10 @@ def load_snapshot_anchor(run_dir: Path, device: torch.device):
     blob = torch.load(run_dir / "snaps" / "anchor.pt", map_location=device)
     with open(run_dir / "snaps" / "anchor.json","r") as f:
         meta = json.load(f)
-    # enforce {"o","d"} keys
     rays_raw = blob["rays"]
     if "o" in rays_raw and "d" in rays_raw:
         rays = {"o": rays_raw["o"].to(device), "d": rays_raw["d"].to(device)}
     else:
-        # old format safety: {"rays_o","rays_d"}
         ro = rays_raw.get("o") or rays_raw.get("rays_o")
         rd = rays_raw.get("d") or rays_raw.get("rays_d")
         rays = {"o": ro.to(device), "d": rd.to(device)}
@@ -136,10 +134,9 @@ from itertools import islice
 def validate(model: NeRFMLP, val_loader, cfg: Dict[str, Any], device: torch.device) -> Dict[str, float]:
     """
     Finite validation over the *validation* loader only.
-
     Controls:
-      --val_batches N   (default 8): evaluate at most N batches from val_loader
-      --val_rays M      (default None): optional hard cap on number of rays total
+      --val_batches N (default 8): evaluate at most N batches
+      --val_rays M    (default None): optional hard cap on total rays
     """
     model.eval()
     n_samples = int(cfg.get("n_samples", 64))
@@ -154,21 +151,21 @@ def validate(model: NeRFMLP, val_loader, cfg: Dict[str, Any], device: torch.devi
     total_mse, total_psnr, seen_rays = 0.0, 0.0, 0
     used_batches = 0
 
-    # iterate ONLY over val_loader (which was built from the val split)
     for batch in islice(val_loader, max_batches):
-        # batch format normalization
-        if "rays" in batch:
+        # normalize formats
+        if "rays" in batch and isinstance(batch["rays"], dict):
             rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
             rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
             rgb_gt = batch.get("rgb", None)
         else:
-            rays_o = batch["origins"]; rays_d = batch["dirs"]; rgb_gt = batch.get("rgb", None)
+            rays_o = batch.get("o", batch.get("origins", batch.get("rays_o")))
+            rays_d = batch.get("d", batch.get("dirs",    batch.get("rays_d")))
+            rgb_gt = batch.get("rgb", None)
 
-        rays_o = rays_o.to(device, non_blocking=True)
-        rays_d = rays_d.to(device, non_blocking=True)
-        rgb_gt = rgb_gt.to(device, non_blocking=True)
+        rays_o = torch.as_tensor(rays_o, device=device)
+        rays_d = torch.as_tensor(rays_d, device=device)
+        rgb_gt = torch.as_tensor(rgb_gt, device=device)
 
-        # ray budget enforcement (optional)
         B = rays_o.shape[0]
         take = B if (ray_budget is None) else min(B, ray_budget - seen_rays)
         if take <= 0:
@@ -178,7 +175,6 @@ def validate(model: NeRFMLP, val_loader, cfg: Dict[str, Any], device: torch.devi
         sub_gt = rgb_gt[:take]
 
         with torch.cuda.amp.autocast(enabled=amp):
-            # validation: no perturbation, black bg (or set via cfg)
             rgb_pred, _depth, _ = forward_batch(
                 model, sub, n_samples, near, far,
                 perturb=False, bg_color=0.0, chunk=chunk, amp=amp
@@ -233,26 +229,30 @@ def main():
     p.add_argument("--snap_every", type=int, default=1000)
     p.add_argument("--ckpt_every", type=int, default=5000)
     p.add_argument("--snap_stride", type=int, default=2)
+    # validation limits
+    p.add_argument("--val_batches", type=int, default=8)
+    p.add_argument("--val_rays", type=int, default=None)
     # resume
     p.add_argument("--resume", type=str, default=None)
 
     args = p.parse_args()
     seed_everything(args.seed)
-    device = torch.device(args.device if torch.cuda.is_available() or args.device=="cpu" else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     print(f"[Device] {device}")
 
-    # loaders
+    # loaders (pin only on CPU; on CUDA our dataset already yields GPU tensors)
     train_loader, val_loader, scene = make_loaders(
         args.dataset,
         batch_size=args.batch_size,
         device=device,
-        return_scene=True
+        pin_memory=(device.type == "cpu"),
+        return_scene=True,
     )
 
     # run dir + anchor
     run_dir = setup_run(args)
     anchor_json = run_dir / "snaps" / "anchor.json"
-    if not anchor_json.exists():
+    if not anchor_json.exists() and scene is not None:
         create_snapshot_anchor(scene, run_dir, device, snap_stride=args.snap_stride)
 
     # model/optim
@@ -286,8 +286,7 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-                # ---- Normalize batch: accept nested {"rays":{"o","d"}} or flat {"rays_o","rays_d"} or {"o","d"} ----
-                # ---- Normalize batch to rays {"o","d"} + optional rgb ----
+        # ---- Normalize batch to rays {"o","d"} + optional rgb ----
         def _pick(d, keys):
             for k in keys:
                 if k in d:
@@ -295,46 +294,36 @@ def main():
             return None
 
         def _extract_rays_rgb(b):
-            # 1) Nested dict case: {"rays": {...}, "rgb": ...}
+            # nested dict: {"rays": {...}, "rgb": ...}
             if "rays" in b and isinstance(b["rays"], dict):
                 ro = _pick(b["rays"], ["o", "origins", "rays_o"])
                 rd = _pick(b["rays"], ["d", "dirs", "rays_d"])
                 rgb = _pick(b, ["rgb", "colors", "target"])
                 if ro is not None and rd is not None:
                     return ro, rd, rgb
-
-            # 2) Flat cases: {"o","d","rgb"} OR {"origins","dirs","rgb"} OR {"rays_o","rays_d","rgb"}
+            # flat dicts
             ro = _pick(b, ["o", "origins", "rays_o"])
             rd = _pick(b, ["d", "dirs", "rays_d"])
             rgb = _pick(b, ["rgb", "colors", "target"])
             if ro is not None and rd is not None:
                 return ro, rd, rgb
-
-            # If we get here, we didn't recognize the structure
             raise KeyError(f"Unrecognized batch format. Keys: {list(b.keys())}")
 
-        # --- use the normalizer
         rays_o, rays_d, rgb_gt = _extract_rays_rgb(batch)
 
         # Move to device
-        if not torch.is_tensor(rays_o): rays_o = torch.as_tensor(rays_o)
-        if not torch.is_tensor(rays_d): rays_d = torch.as_tensor(rays_d)
-        rays = {
-            "o": rays_o.to(device, non_blocking=True),
-            "d": rays_d.to(device, non_blocking=True),
-        }
-        if rgb_gt is not None:
-            if not torch.is_tensor(rgb_gt): rgb_gt = torch.as_tensor(rgb_gt)
-            rgb_gt = rgb_gt.to(device, non_blocking=True)
-
+        rays_o = torch.as_tensor(rays_o, device=device)
+        rays_d = torch.as_tensor(rays_d, device=device)
+        rays = {"o": rays_o, "d": rays_d}
+        if rgb_gt is None:
+            raise KeyError("Training batch missing 'rgb' ground truth.")
+        rgb_gt = torch.as_tensor(rgb_gt, device=device)
 
         optim.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp):
             rgb_pred, _depth, _ = forward_batch(
                 model, rays, n_samples, near, far, perturb=True, bg_color=0.0, chunk=chunk, amp=amp
             )
-            if rgb_gt is None:
-                raise KeyError("Training batch missing 'rgb' ground truth.")
             loss = torch.mean((rgb_pred - rgb_gt) ** 2)
 
         if scaler and amp:
