@@ -161,10 +161,10 @@ def main():
 
     # loaders
     train_loader, val_loader, scene = make_loaders(
-        dataset_npz=args.dataset,
+        args.dataset,
         batch_size=args.batch_size,
         device=device,
-        return_scene=True  # ensure your make_loaders supports this; otherwise fetch scene elsewhere
+        return_scene=True
     )
 
     # run dir + anchor
