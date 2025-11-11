@@ -238,18 +238,27 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-        # Normalize batch format (supports flat or nested)
-        if "rays" in batch:
-            rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
-            rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
-            rgb_gt = batch.get("rgb", None)
-        else:
-            rays_o = batch["rays_o"]
-            rays_d = batch["rays_d"]
-            rgb_gt = batch.get("rgb", None)
+                # ---- Normalize batch: accept nested {"rays":{"o","d"}} or flat {"rays_o","rays_d"} or {"o","d"} ----
+        def _extract_rays_rgb(b):
+            if "rays" in b and isinstance(b["rays"], dict):
+                ro = b["rays"].get("o") or b["rays"].get("origins")
+                rd = b["rays"].get("d") or b["rays"].get("dirs")
+                rgb = b.get("rgb", None)
+                if ro is not None and rd is not None:
+                    return ro, rd, rgb
+            if "rays_o" in b and "rays_d" in b:
+                return b["rays_o"], b["rays_d"], b.get("rgb", None)
+            if "o" in b and "d" in b:
+                return b["o"], b["d"], b.get("rgb", None)
+            raise KeyError(f"Unrecognized batch format. Keys: {list(b.keys())}")
 
-        rays = {"o": rays_o.to(device, non_blocking=True),
-                "d": rays_d.to(device, non_blocking=True)}
+        rays_o, rays_d, rgb_gt = _extract_rays_rgb(batch)
+
+        # Move to device
+        rays = {
+            "o": rays_o.to(device, non_blocking=True),
+            "d": rays_d.to(device, non_blocking=True),
+        }
         if rgb_gt is not None and torch.is_tensor(rgb_gt):
             rgb_gt = rgb_gt.to(device, non_blocking=True)
 
