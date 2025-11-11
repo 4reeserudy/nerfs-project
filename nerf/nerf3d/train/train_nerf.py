@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 from typing import Dict, Any, Tuple
+import numpy as np
 
 import torch
 from torch.optim import Adam
