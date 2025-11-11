@@ -226,8 +226,21 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-        rays = {k: v.to(device, non_blocking=True) for k, v in batch["rays"].items()}
-        rgb_gt = batch["rgb"].to(device, non_blocking=True)
+        # Normalize batch format (supports flat or nested)
+        if "rays" in batch:
+            rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
+            rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
+            rgb_gt = batch.get("rgb", None)
+        else:
+            rays_o = batch["rays_o"]
+            rays_d = batch["rays_d"]
+            rgb_gt = batch.get("rgb", None)
+
+        # Move to device
+        rays = {"o": rays_o.to(device, non_blocking=True),
+                "d": rays_d.to(device, non_blocking=True)}
+        if rgb_gt is not None and torch.is_tensor(rgb_gt):
+            rgb_gt = rgb_gt.to(device, non_blocking=True)
 
         optim.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp):
