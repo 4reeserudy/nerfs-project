@@ -132,26 +132,51 @@ def maybe_snapshot(model, step: int, cfg: Dict[str, Any], device: torch.device, 
 
 @torch.no_grad()
 def validate(model: NeRFMLP, loader, cfg: Dict[str, Any], device: torch.device) -> Dict[str, float]:
+    """
+    Supports batches in either format:
+      A) {"origins","dirs","rgb", ...}
+      B) {"rays": {"o"/"origins","d"/"dirs"}, "rgb": ...}
+    """
     model.eval()
     n_samples = int(cfg.get("n_samples", 64))
-    near, far = float(cfg.get("near",2.0)), float(cfg.get("far",6.0))
-    chunk = cfg.get("chunk", None)
+    near, far = float(cfg.get("near", 2.0)), float(cfg.get("far", 6.0))
+    chunk = int(cfg.get("chunk", 8192))
     amp = bool(cfg.get("amp", False)) and device.type == "cuda"
 
     total_mse, total_psnr, total = 0.0, 0.0, 0
+
     for batch in loader:
-        # Expect nested format from our RaysDataset
-        rays = {k: v.to(device, non_blocking=True) for k, v in batch["rays"].items()}
-        rgb_gt = batch["rgb"].to(device, non_blocking=True)
+        # ---- unify batch format (reuse the same logic as training) ----
+        if "rays" in batch:
+            rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
+            rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
+            rgb_gt = batch.get("rgb", None)
+        else:
+            rays_o = batch["origins"]
+            rays_d = batch["dirs"]
+            rgb_gt = batch.get("rgb", None)
+
+        rays = {
+            "o": rays_o.to(device, non_blocking=True),
+            "d": rays_d.to(device, non_blocking=True),
+        }
+        rgb_gt = rgb_gt.to(device, non_blocking=True) if torch.is_tensor(rgb_gt) else None
 
         with torch.cuda.amp.autocast(enabled=amp):
-            rgb_pred, _depth, _ = forward_batch(model, rays, n_samples, near, far,
-                                                perturb=False, bg_color=0.0, chunk=chunk, amp=amp)
+            rgb_pred, _depth, _ = forward_batch(
+                model, rays, n_samples, near, far,
+                perturb=False, bg_color=0.0, chunk=chunk, amp=amp
+            )
             mse = torch.mean((rgb_pred - rgb_gt) ** 2)
 
-        total_mse += float(mse.item()); total_psnr += float(psnr(mse).item()); total += 1
+        total_mse  += float(mse.item())
+        total_psnr += float(psnr(mse).item())
+        total      += 1
 
-    return {"val_mse": total_mse / max(total,1), "val_psnr": total_psnr / max(total,1)}
+    return {
+        "val_mse":  total_mse / max(total, 1),
+        "val_psnr": total_psnr / max(total, 1),
+    }
 
 # ------------------------------- main loop ------------------------------
 
