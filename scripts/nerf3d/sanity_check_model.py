@@ -2,6 +2,8 @@
 from __future__ import annotations
 import argparse, torch
 from nerf.nerf3d.models.main_model import NeRFMLP
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 def main():
     p = argparse.ArgumentParser()
