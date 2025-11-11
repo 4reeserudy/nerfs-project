@@ -183,9 +183,14 @@ def make_scene_from_npz(
             else:
                 raise ValueError("Unsupported 'focal' format")
 
-    images_t = torch.from_numpy(images_np).contiguous()
-    c2ws_t   = torch.from_numpy(c2ws_np).contiguous()
-    Ks_t     = torch.from_numpy(Ks_np).contiguous()
+    # --- torch tensors ---
+    images_t = torch.from_numpy(images_np).contiguous()   # (M,H,W,3)
+    c2ws_t   = torch.from_numpy(c2ws_np).contiguous()     # (M,4,4)
+    Ks_t     = torch.from_numpy(Ks_np).contiguous()       # (1,3,3) or (M,3,3)
+
+    # If K is shared (1,3,3), expand to per-image (M,3,3) for safe indexing
+    if Ks_t.ndim == 3 and Ks_t.shape[0] == 1:
+        Ks_t = Ks_t.expand(images_t.shape[0], -1, -1).contiguous()
 
     if near is None or far is None:
         n, f = choose_near_far(c2ws_t, (H, W), focal=focal_val, fallback=(2.0, 6.0))
