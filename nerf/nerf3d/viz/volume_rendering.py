@@ -1,6 +1,6 @@
 # nerf/nerf3d/viz/volume_rendering.py
 from __future__ import annotations
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Union
 import torch
 
 
@@ -8,9 +8,14 @@ import torch
 # Core utilities (no I/O, vectorized over batch B and samples S)
 # -----------------------------------------------------------------------------
 
+def _to_tensor(x, *, dtype=torch.float32, device=None) -> torch.Tensor:
+    if torch.is_tensor(x):
+        return x.to(device=device if device is not None else x.device, dtype=dtype)
+    return torch.as_tensor(x, dtype=dtype, device=device)
+
 def compute_deltas(
-    t_edges: Optional[torch.Tensor] = None,   # (B, S+1)
-    t_centers: Optional[torch.Tensor] = None, # (B, S)
+    t_edges: Optional[Union[torch.Tensor, "np.ndarray", list]] = None,    # (B, S+1)
+    t_centers: Optional[Union[torch.Tensor, "np.ndarray", list]] = None,  # (B, S)
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -24,11 +29,12 @@ def compute_deltas(
         build edges by midpointing neighbors and extrapolating the two ends.
     """
     if t_edges is not None:
+        te = _to_tensor(t_edges)
         # (B, S), (B, S)
-        t_mid = 0.5 * (t_edges[:, :-1] + t_edges[:, 1:])
-        deltas = t_edges[:, 1:] - t_edges[:, :-1]
+        t_mid  = 0.5 * (te[:, :-1] + te[:, 1:])
+        deltas = te[:, 1:] - te[:, :-1]
     elif t_centers is not None:
-        c = t_centers
+        c = _to_tensor(t_centers)
         # Mid-edges between centers
         mid_edges = 0.5 * (c[:, :-1] + c[:, 1:])               # (B, S-1)
         # Extrapolate left/right edges using first/last gaps
@@ -38,8 +44,8 @@ def compute_deltas(
         right_edge = (c[:, -1] + 0.5 * right_gap)              # (B, 1)
         edges = torch.cat([left_edge, mid_edges, right_edge], dim=1)  # (B, S+1)
 
-        t_mid = c                                              # centers are already midpoints
-        deltas = edges[:, 1:] - edges[:, :-1]                  # (B, S)
+        t_mid  = c                                              # centers are already midpoints
+        deltas = edges[:, 1:] - edges[:, :-1]                   # (B, S)
     else:
         raise ValueError("compute_deltas: provide either t_edges or t_centers")
 
@@ -48,16 +54,22 @@ def compute_deltas(
 
 
 def alpha_from_sigma(
-    sigma: torch.Tensor,     # (B, S)
-    deltas: torch.Tensor,    # (B, S)
+    sigma: torch.Tensor,                     # (B, S)
+    deltas: Union[torch.Tensor, tuple, list],# (B, S) or wrapper thereof
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
     Beer–Lambert opacity per sample:
         α_i = 1 - exp(-σ_i * Δ_i)
+    Accepts deltas as tensor or (tensor, ...) tuple/list and coerces dtype/device.
     """
-    # Ensure positive spacings; avoid negative exponents explosion
+    # Unwrap tuple/list (some callsites may pass (deltas, ...))
+    if isinstance(deltas, (tuple, list)):
+        deltas = deltas[0]
+
+    deltas = _to_tensor(deltas, dtype=sigma.dtype, device=sigma.device)
     deltas = torch.clamp_min(deltas, eps)
+
     # Product σ * Δ can be large; clamp upper bound for numerical stability
     tau = torch.clamp(sigma * deltas, min=0.0, max=60.0)  # exp(-60) ~ 8.8e-27
     alpha = 1.0 - torch.exp(-tau)
@@ -75,15 +87,11 @@ def transmittance_from_alpha(
         T_i = Π_{j < i} (1 - α_j)
 
     Returned shape: (B, S)
-
-    Implementation uses cumulative product for efficiency and stability.
     """
-    # (B, S) → (B, S) exclusive cumprod of (1 - α)
-    # torch.cumprod is inclusive, so shift by one
-    one_minus_a = torch.clamp(1.0 - alpha, eps, 1.0)  # avoid 0
-    cum = torch.cumprod(one_minus_a, dim=-1)          # T_0 = (1-α0), T_1 = (1-α0)(1-α1), ...
-    
-    # Convert to exclusive: shift right and insert 1 at start
+    one_minus_a = torch.clamp(1.0 - alpha, eps, 1.0)  # avoid exact zeros
+    cum = torch.cumprod(one_minus_a, dim=-1)          # inclusive
+
+    # Convert to exclusive by right-shifting and inserting 1 at start
     B, S = alpha.shape
     T = torch.ones((B, S), device=alpha.device, dtype=alpha.dtype)
     T[:, 1:] = cum[:, :-1]
@@ -96,13 +104,10 @@ def weights_from_alpha_T(
 ) -> torch.Tensor:
     """
     Convert opacity α and transmittance T into volume-rendering weights:
-
         w_i = α_i * T_i
-
     These weights sum to ≤ 1 per ray (remaining mass goes to background).
     """
     weights = alpha * T
-    # Clamp for safety; weights must be non-negative
     return torch.clamp(weights, 0.0, 1.0)
 
 
@@ -143,10 +148,10 @@ def composite_depth(
 # -----------------------------------------------------------------------------
 
 def render_volume(
-    sigma: torch.Tensor,                    # (B, S)
-    colors: torch.Tensor,                   # (B, S, 3) in [0,1]
-    t_edges: Optional[torch.Tensor] = None, # (B, S+1)
-    t_centers: Optional[torch.Tensor] = None,# (B, S)
+    sigma: torch.Tensor,                     # (B, S)
+    colors: torch.Tensor,                    # (B, S, 3) in [0,1]
+    t_edges: Optional[Union[torch.Tensor, "np.ndarray", list]] = None,   # (B, S+1)
+    t_centers: Optional[Union[torch.Tensor, "np.ndarray", list]] = None, # (B, S)
     white_bg: bool = False,
     eps: float = 1e-10,
 ) -> Dict[str, torch.Tensor]:
@@ -164,13 +169,13 @@ def render_volume(
 
     # Shapes sanity
     B, S = sigma.shape
-    if colors.shape[:2] != (B, S):
+    if colors.shape[:2] != (B, S) or colors.shape[-1] != 3:
         raise ValueError(f"colors shape {colors.shape} must be (B,S,3) with B={B}, S={S}")
-    if colors.shape[-1] != 3:
-        raise ValueError("colors must have last dim = 3")
 
     # 1) centers & spacings
     t_mid, deltas = compute_deltas(t_edges=t_edges, t_centers=t_centers, eps=eps)  # (B,S), (B,S)
+    t_mid  = _to_tensor(t_mid,  dtype=sigma.dtype, device=sigma.device)
+    deltas = _to_tensor(deltas, dtype=sigma.dtype, device=sigma.device)
 
     # 2) alpha from density
     alpha = alpha_from_sigma(sigma, deltas, eps=eps)  # (B,S)
