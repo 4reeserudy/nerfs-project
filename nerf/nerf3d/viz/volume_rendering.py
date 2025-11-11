@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple, Union
 import torch
+import numpy as np
 
 
 # -----------------------------------------------------------------------------
