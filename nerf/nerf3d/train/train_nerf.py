@@ -46,33 +46,24 @@ def setup_model_and_optim(cfg: Dict[str, Any]) -> Tuple[NeRFMLP, Adam, torch.cud
 
 # --------------------------- snapshot anchor ---------------------------
 
-def _to_np_f32(x):
-    # Accept list/tuple/np/tensor; return np.float32
-    if isinstance(x, torch.Tensor):
-        x = x.detach().cpu().numpy()
-    return np.asarray(x, dtype=np.float32)
-
 def _pixels_to_rays_anchor(pix, K, c2w, device: torch.device):
     """
-    pix: (N,2) pixels as np.ndarray / list / torch.Tensor
+    pix: (N,2) pixels as array-like
     K:   (3,3) intrinsics
     c2w: (4,4) camera-to-world
-    Returns dict {rays_o, rays_d} on `device`.
+    Returns dict {"o","d"} on `device`.
     """
-    # Coerce everything to torch on the correct device/dtype
-    pixt = torch.as_tensor(pix, dtype=torch.float32, device=device)           # (N,2)
-    Kt   = torch.as_tensor(K,   dtype=torch.float32, device=device)           # (3,3) or (1,3,3)
-    c2wt = torch.as_tensor(c2w, dtype=torch.float32, device=device)           # (4,4)
+    pixt = torch.as_tensor(pix, dtype=torch.float32, device=device).reshape(-1, 2)  # (N,2)
+    Kt   = torch.as_tensor(K,   dtype=torch.float32, device=device)
+    c2wt = torch.as_tensor(c2w, dtype=torch.float32, device=device)
 
-    # Squeeze optional leading dim (e.g., Ks shaped (1,3,3))
     if Kt.ndim == 3 and Kt.shape[0] == 1:
         Kt = Kt[0]
-    # Safety reshapes
     Kt   = Kt.reshape(3, 3)
     c2wt = c2wt.reshape(4, 4)
 
     rays_o, rays_d = pixels_to_rays_batched(pixt, Kt, c2wt, pixel_center=True)
-    return {"rays_o": rays_o, "rays_d": rays_d}
+    return {"o": rays_o, "d": rays_d}
 
 def create_snapshot_anchor(scene: Dict[str, Any], run_dir: Path, device: torch.device, snap_stride: int = 2):
     img = scene["images_val"][0]   # (H,W,3) float
@@ -80,46 +71,61 @@ def create_snapshot_anchor(scene: Dict[str, Any], run_dir: Path, device: torch.d
     H, W = img.shape[:2]
     fx = fy = float(scene["focal"]); cx, cy = (W - 1) * 0.5, (H - 1) * 0.5
     K = [[fx, 0, cx],[0, fy, cy],[0,0,1]]
+
     s = max(1, int(snap_stride))
-    ys = torch.arange(0, H, s); xs = torch.arange(0, W, s)
+    ys = torch.arange(0, H, s, dtype=torch.int64)
+    xs = torch.arange(0, W, s, dtype=torch.int64)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     pix = torch.stack([gx, gy], dim=-1).reshape(-1, 2).cpu().numpy()
-    rays = _pixels_to_rays_anchor(pix, K, c2w, device)
+
+    rays = _pixels_to_rays_anchor(pix, K, c2w, device)  # {"o","d"}
     torch.save({"rays": {k: v.cpu() for k, v in rays.items()}}, run_dir / "snaps" / "anchor.pt")
     with open(run_dir / "snaps" / "anchor.json", "w") as f:
-        json.dump({"H":H, "W":W, "stride":s, "focal":float(scene["focal"]),
-                   "c2w": torch.tensor(c2w).tolist()}, f, indent=2)
+        json.dump({"H": int(H), "W": int(W), "stride": int(s), "focal": float(scene["focal"]),
+                   "c2w": torch.as_tensor(c2w).tolist()}, f, indent=2)
 
 def load_snapshot_anchor(run_dir: Path, device: torch.device):
     blob = torch.load(run_dir / "snaps" / "anchor.pt", map_location=device)
     with open(run_dir / "snaps" / "anchor.json","r") as f:
         meta = json.load(f)
-    rays = {k: v.to(device) for k, v in blob["rays"].items()}
+    # enforce {"o","d"} keys
+    rays_raw = blob["rays"]
+    if "o" in rays_raw and "d" in rays_raw:
+        rays = {"o": rays_raw["o"].to(device), "d": rays_raw["d"].to(device)}
+    else:
+        # old format safety: {"rays_o","rays_d"}
+        ro = rays_raw.get("o") or rays_raw.get("rays_o")
+        rd = rays_raw.get("d") or rays_raw.get("rays_d")
+        rays = {"o": ro.to(device), "d": rd.to(device)}
     return rays, meta
 
 @torch.no_grad()
 def maybe_snapshot(model, step: int, cfg: Dict[str, Any], device: torch.device, run_dir: Path):
     anchor_json = run_dir / "snaps" / "anchor.json"
-    if not anchor_json.exists(): return
+    if not anchor_json.exists():
+        return
     rays, meta = load_snapshot_anchor(run_dir, device)
     n = rays["o"].shape[0]
     chunk = int(cfg.get("chunk", 8192))
     near, far = float(cfg.get("near",2.0)), float(cfg.get("far",6.0))
     n_samples = int(cfg.get("n_samples",64))
     amp = bool(cfg.get("amp", False)) and device.type == "cuda"
+
     outs = []
     for s in range(0, n, chunk):
-        sub = {k: v[s:s+chunk] for k, v in rays.items()}
+        sub = {"o": rays["o"][s:s+chunk], "d": rays["d"][s:s+chunk]}
         with torch.cuda.amp.autocast(enabled=amp):
             rgb, _depth, _ = forward_batch(model, sub, n_samples, near, far,
                                            perturb=False, bg_color=0.0, chunk=chunk, amp=amp)
         outs.append(rgb.detach().cpu())
     rgb_all = torch.cat(outs, dim=0).clamp(0,1)
-    H,W,stride = int(meta["H"]), int(meta["W"]), int(meta["stride"])
+
+    H, W, stride = int(meta["H"]), int(meta["W"]), int(meta["stride"])
     rh, rw = (H + stride - 1)//stride, (W + stride - 1)//stride
     img = (rgb_all.view(rh, rw, 3).mul(255).byte().numpy())
     im = Image.fromarray(img, mode="RGB")
-    if stride > 1: im = im.resize((W, H), Image.NEAREST)
+    if stride > 1:
+        im = im.resize((W, H), Image.NEAREST)
     im.save(run_dir / "snaps" / f"step_{step:06d}.png")
 
 # ------------------------------ validate --------------------------------
@@ -131,15 +137,20 @@ def validate(model: NeRFMLP, loader, cfg: Dict[str, Any], device: torch.device) 
     near, far = float(cfg.get("near",2.0)), float(cfg.get("far",6.0))
     chunk = cfg.get("chunk", None)
     amp = bool(cfg.get("amp", False)) and device.type == "cuda"
+
     total_mse, total_psnr, total = 0.0, 0.0, 0
     for batch in loader:
+        # Expect nested format from our RaysDataset
         rays = {k: v.to(device, non_blocking=True) for k, v in batch["rays"].items()}
         rgb_gt = batch["rgb"].to(device, non_blocking=True)
+
         with torch.cuda.amp.autocast(enabled=amp):
             rgb_pred, _depth, _ = forward_batch(model, rays, n_samples, near, far,
                                                 perturb=False, bg_color=0.0, chunk=chunk, amp=amp)
             mse = torch.mean((rgb_pred - rgb_gt) ** 2)
+
         total_mse += float(mse.item()); total_psnr += float(psnr(mse).item()); total += 1
+
     return {"val_mse": total_mse / max(total,1), "val_psnr": total_psnr / max(total,1)}
 
 # ------------------------------- main loop ------------------------------
@@ -205,7 +216,8 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
-        if scaler and "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
+        if scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
+            scaler.load_state_dict(ckpt["scaler"])
         start_step = int(ckpt.get("step", 0))
         print(f"[Resume] from {args.resume} @ step {start_step}")
 
@@ -236,7 +248,6 @@ def main():
             rays_d = batch["rays_d"]
             rgb_gt = batch.get("rgb", None)
 
-        # Move to device
         rays = {"o": rays_o.to(device, non_blocking=True),
                 "d": rays_d.to(device, non_blocking=True)}
         if rgb_gt is not None and torch.is_tensor(rgb_gt):
@@ -247,6 +258,8 @@ def main():
             rgb_pred, _depth, _ = forward_batch(
                 model, rays, n_samples, near, far, perturb=True, bg_color=0.0, chunk=chunk, amp=amp
             )
+            if rgb_gt is None:
+                raise KeyError("Training batch missing 'rgb' ground truth.")
             loss = torch.mean((rgb_pred - rgb_gt) ** 2)
 
         if scaler and amp:
