@@ -1,0 +1,381 @@
+# nerf/nerf3d/train/train_nerf.py
+from __future__ import annotations
+import argparse, json
+from pathlib import Path
+from typing import Dict, Any, Tuple
+import numpy as np
+
+import torch
+from torch.optim import Adam
+from PIL import Image
+
+from nerf.nerf3d.data.dataloader import make_loaders, seed_everything
+from nerf.nerf3d.models.main_model import NeRFMLP
+from nerf.nerf3d.engine.step import forward_batch
+from nerf.nerf3d.data.losses import psnr
+from nerf.nerf3d.rays.ray_sampler import pixels_to_rays_batched
+
+# ------------------------------- setup ---------------------------------
+
+def setup_run(args) -> Path:
+    save_dir = Path(getattr(args, "save_dir", "results/nerf3d"))
+    dataset_stem = Path(args.dataset).stem if getattr(args, "dataset", None) else "dataset"
+    tag = getattr(args, "tag", None)
+    run_name = f"L{args.L_xyz}_Ld{args.L_dir}_W{args.W}" + (f"_{tag}" if tag else "")
+    run_dir = save_dir / dataset_stem / run_name
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (run_dir / "snaps").mkdir(parents=True, exist_ok=True)
+    (run_dir / "plots").mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "run_config.json", "w") as f:
+        json.dump(vars(args), f, indent=2, default=str)
+    print(f"[RunDir] {run_dir}")
+    return run_dir
+
+def setup_model_and_optim(cfg: Dict[str, Any]) -> Tuple[NeRFMLP, Adam, torch.cuda.amp.GradScaler | None]:
+    device = torch.device(cfg.get("device", "cpu"))
+    model = NeRFMLP(L_xyz=int(cfg["L_xyz"]), L_dir=int(cfg["L_dir"]), width=int(cfg["W"])).to(device)
+    optim = Adam(model.parameters(),
+                 lr=float(cfg.get("lr", 5e-4)),
+                 betas=tuple(cfg.get("betas", (0.9, 0.999))),
+                 weight_decay=float(cfg.get("weight_decay", 0.0)))
+    use_amp = bool(cfg.get("amp", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"[Model] NeRF(Lxyz={cfg['L_xyz']}, Ldir={cfg['L_dir']}, W={cfg['W']}) on {device}")
+    print(f"[Optim] Adam(lr={cfg.get('lr', 5e-4)}, amp={use_amp})")
+    return model, optim, scaler
+
+# --------------------------- snapshot anchor ---------------------------
+
+def _pixels_to_rays_anchor(pix, K, c2w, device: torch.device):
+    """
+    pix: (N,2) pixels as array-like
+    K:   (3,3) intrinsics
+    c2w: (4,4) camera-to-world
+    Returns dict {"o","d"} on `device`.
+    """
+    pixt = torch.as_tensor(pix, dtype=torch.float32, device=device).reshape(-1, 2)  # (N,2)
+    Kt   = torch.as_tensor(K,   dtype=torch.float32, device=device)
+    c2wt = torch.as_tensor(c2w, dtype=torch.float32, device=device)
+
+    if Kt.ndim == 3 and Kt.shape[0] == 1:
+        Kt = Kt[0]
+    Kt   = Kt.reshape(3, 3)
+    c2wt = c2wt.reshape(4, 4)
+
+    rays_o, rays_d = pixels_to_rays_batched(pixt, Kt, c2wt, pixel_center=True)
+    return {"o": rays_o, "d": rays_d}
+
+def create_snapshot_anchor(scene: Dict[str, Any], run_dir: Path, device: torch.device, snap_stride: int = 2):
+    img = scene["images_val"][0]   # (H,W,3) float
+    c2w = scene["c2ws_val"][0]     # (4,4)
+    H, W = img.shape[:2]
+    fx = fy = float(scene["focal"]); cx, cy = (W - 1) * 0.5, (H - 1) * 0.5
+    K = [[fx, 0, cx],[0, fy, cy],[0,0,1]]
+
+    s = max(1, int(snap_stride))
+    ys = torch.arange(0, H, s, dtype=torch.int64)
+    xs = torch.arange(0, W, s, dtype=torch.int64)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    pix = torch.stack([gx, gy], dim=-1).reshape(-1, 2).cpu().numpy()
+
+    rays = _pixels_to_rays_anchor(pix, K, c2w, device)  # {"o","d"}
+    torch.save({"rays": {k: v.cpu() for k, v in rays.items()}}, run_dir / "snaps" / "anchor.pt")
+    with open(run_dir / "snaps" / "anchor.json", "w") as f:
+        json.dump({"H": int(H), "W": int(W), "stride": int(s), "focal": float(scene["focal"]),
+                   "c2w": torch.as_tensor(c2w).tolist()}, f, indent=2)
+
+def load_snapshot_anchor(run_dir: Path, device: torch.device):
+    blob = torch.load(run_dir / "snaps" / "anchor.pt", map_location=device)
+    with open(run_dir / "snaps" / "anchor.json","r") as f:
+        meta = json.load(f)
+    # enforce {"o","d"} keys
+    rays_raw = blob["rays"]
+    if "o" in rays_raw and "d" in rays_raw:
+        rays = {"o": rays_raw["o"].to(device), "d": rays_raw["d"].to(device)}
+    else:
+        # old format safety: {"rays_o","rays_d"}
+        ro = rays_raw.get("o") or rays_raw.get("rays_o")
+        rd = rays_raw.get("d") or rays_raw.get("rays_d")
+        rays = {"o": ro.to(device), "d": rd.to(device)}
+    return rays, meta
+
+@torch.no_grad()
+def maybe_snapshot(model, step: int, cfg: Dict[str, Any], device: torch.device, run_dir: Path):
+    anchor_json = run_dir / "snaps" / "anchor.json"
+    if not anchor_json.exists():
+        return
+    rays, meta = load_snapshot_anchor(run_dir, device)
+    n = rays["o"].shape[0]
+    chunk = int(cfg.get("chunk", 8192))
+    near, far = float(cfg.get("near",2.0)), float(cfg.get("far",6.0))
+    n_samples = int(cfg.get("n_samples",64))
+    amp = bool(cfg.get("amp", False)) and device.type == "cuda"
+
+    outs = []
+    for s in range(0, n, chunk):
+        sub = {"o": rays["o"][s:s+chunk], "d": rays["d"][s:s+chunk]}
+        with torch.cuda.amp.autocast(enabled=amp):
+            rgb, _depth, _ = forward_batch(model, sub, n_samples, near, far,
+                                           perturb=False, bg_color=0.0, chunk=chunk, amp=amp)
+        outs.append(rgb.detach().cpu())
+    rgb_all = torch.cat(outs, dim=0).clamp(0,1)
+
+    H, W, stride = int(meta["H"]), int(meta["W"]), int(meta["stride"])
+    rh, rw = (H + stride - 1)//stride, (W + stride - 1)//stride
+    img = (rgb_all.view(rh, rw, 3).mul(255).byte().numpy())
+    im = Image.fromarray(img, mode="RGB")
+    if stride > 1:
+        im = im.resize((W, H), Image.NEAREST)
+    im.save(run_dir / "snaps" / f"step_{step:06d}.png")
+
+# ------------------------------ validate --------------------------------
+
+from itertools import islice
+
+@torch.no_grad()
+def validate(model: NeRFMLP, val_loader, cfg: Dict[str, Any], device: torch.device) -> Dict[str, float]:
+    """
+    Finite validation over the *validation* loader only.
+
+    Controls:
+      --val_batches N   (default 8): evaluate at most N batches from val_loader
+      --val_rays M      (default None): optional hard cap on number of rays total
+    """
+    model.eval()
+    n_samples = int(cfg.get("n_samples", 64))
+    near, far = float(cfg.get("near", 2.0)), float(cfg.get("far", 6.0))
+    chunk = int(cfg.get("chunk", 8192))
+    amp = bool(cfg.get("amp", False)) and device.type == "cuda"
+
+    max_batches = int(cfg.get("val_batches", 8))
+    ray_budget = cfg.get("val_rays", None)
+    ray_budget = int(ray_budget) if ray_budget is not None else None
+
+    total_mse, total_psnr, seen_rays = 0.0, 0.0, 0
+    used_batches = 0
+
+    # iterate ONLY over val_loader (which was built from the val split)
+    for batch in islice(val_loader, max_batches):
+        # batch format normalization
+        if "rays" in batch:
+            rays_o = batch["rays"].get("o", batch["rays"].get("origins"))
+            rays_d = batch["rays"].get("d", batch["rays"].get("dirs"))
+            rgb_gt = batch.get("rgb", None)
+        else:
+            rays_o = batch["origins"]; rays_d = batch["dirs"]; rgb_gt = batch.get("rgb", None)
+
+        rays_o = rays_o.to(device, non_blocking=True)
+        rays_d = rays_d.to(device, non_blocking=True)
+        rgb_gt = rgb_gt.to(device, non_blocking=True)
+
+        # ray budget enforcement (optional)
+        B = rays_o.shape[0]
+        take = B if (ray_budget is None) else min(B, ray_budget - seen_rays)
+        if take <= 0:
+            break
+
+        sub = {"o": rays_o[:take], "d": rays_d[:take]}
+        sub_gt = rgb_gt[:take]
+
+        with torch.cuda.amp.autocast(enabled=amp):
+            # validation: no perturbation, black bg (or set via cfg)
+            rgb_pred, _depth, _ = forward_batch(
+                model, sub, n_samples, near, far,
+                perturb=False, bg_color=0.0, chunk=chunk, amp=amp
+            )
+            mse = torch.mean((rgb_pred - sub_gt) ** 2)
+
+        total_mse += float(mse.item())
+        total_psnr += float(psnr(mse).item())
+        seen_rays += take
+        used_batches += 1
+
+        if ray_budget is not None and seen_rays >= ray_budget:
+            break
+
+    used_batches = max(used_batches, 1)
+    return {
+        "val_mse":  total_mse / used_batches,
+        "val_psnr": total_psnr / used_batches,
+        "val_rays": seen_rays,
+        "val_batches": used_batches,
+    }
+
+# ------------------------------- main loop ------------------------------
+
+def main():
+    p = argparse.ArgumentParser()
+    # data/run
+    p.add_argument("--dataset", type=str, required=True)
+    p.add_argument("--save_dir", type=str, default="results/nerf3d")
+    p.add_argument("--tag", type=str, default=None)
+    # model
+    p.add_argument("--L_xyz", type=int, default=10)
+    p.add_argument("--L_dir", type=int, default=4)
+    p.add_argument("--W", type=int, default=256)
+    # render
+    p.add_argument("--n_samples", type=int, default=64)
+    p.add_argument("--near", type=float, default=2.0)
+    p.add_argument("--far", type=float, default=6.0)
+    p.add_argument("--chunk", type=int, default=8192)
+    # train
+    p.add_argument("--iters", type=int, default=20000)
+    p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.999))
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--seed", type=int, default=42)
+    # cadence
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--val_every", type=int, default=1000)
+    p.add_argument("--snap_every", type=int, default=1000)
+    p.add_argument("--ckpt_every", type=int, default=5000)
+    p.add_argument("--snap_stride", type=int, default=2)
+    # resume
+    p.add_argument("--resume", type=str, default=None)
+
+    args = p.parse_args()
+    seed_everything(args.seed)
+    device = torch.device(args.device if torch.cuda.is_available() or args.device=="cpu" else "cpu")
+    print(f"[Device] {device}")
+
+    # loaders
+    train_loader, val_loader, scene = make_loaders(
+        args.dataset,
+        batch_size=args.batch_size,
+        device=device,
+        return_scene=True
+    )
+
+    # run dir + anchor
+    run_dir = setup_run(args)
+    anchor_json = run_dir / "snaps" / "anchor.json"
+    if not anchor_json.exists():
+        create_snapshot_anchor(scene, run_dir, device, snap_stride=args.snap_stride)
+
+    # model/optim
+    model, optim, scaler = setup_model_and_optim(vars(args))
+
+    # resume
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optim.load_state_dict(ckpt["optim"])
+        if scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_step = int(ckpt.get("step", 0))
+        print(f"[Resume] from {args.resume} @ step {start_step}")
+
+    # run log
+    run_log = {"iters": [], "train_psnr": [], "val_psnr": []}
+
+    # training (step-based)
+    amp = bool(args.amp) and device.type == "cuda"
+    n_samples = args.n_samples
+    near, far = float(args.near), float(args.far)
+    chunk = int(args.chunk)
+
+    train_iter = iter(train_loader)
+    for step in range(start_step + 1, args.iters + 1):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+                # ---- Normalize batch: accept nested {"rays":{"o","d"}} or flat {"rays_o","rays_d"} or {"o","d"} ----
+                # ---- Normalize batch to rays {"o","d"} + optional rgb ----
+        def _pick(d, keys):
+            for k in keys:
+                if k in d:
+                    return d[k]
+            return None
+
+        def _extract_rays_rgb(b):
+            # 1) Nested dict case: {"rays": {...}, "rgb": ...}
+            if "rays" in b and isinstance(b["rays"], dict):
+                ro = _pick(b["rays"], ["o", "origins", "rays_o"])
+                rd = _pick(b["rays"], ["d", "dirs", "rays_d"])
+                rgb = _pick(b, ["rgb", "colors", "target"])
+                if ro is not None and rd is not None:
+                    return ro, rd, rgb
+
+            # 2) Flat cases: {"o","d","rgb"} OR {"origins","dirs","rgb"} OR {"rays_o","rays_d","rgb"}
+            ro = _pick(b, ["o", "origins", "rays_o"])
+            rd = _pick(b, ["d", "dirs", "rays_d"])
+            rgb = _pick(b, ["rgb", "colors", "target"])
+            if ro is not None and rd is not None:
+                return ro, rd, rgb
+
+            # If we get here, we didn't recognize the structure
+            raise KeyError(f"Unrecognized batch format. Keys: {list(b.keys())}")
+
+        # --- use the normalizer
+        rays_o, rays_d, rgb_gt = _extract_rays_rgb(batch)
+
+        # Move to device
+        if not torch.is_tensor(rays_o): rays_o = torch.as_tensor(rays_o)
+        if not torch.is_tensor(rays_d): rays_d = torch.as_tensor(rays_d)
+        rays = {
+            "o": rays_o.to(device, non_blocking=True),
+            "d": rays_d.to(device, non_blocking=True),
+        }
+        if rgb_gt is not None:
+            if not torch.is_tensor(rgb_gt): rgb_gt = torch.as_tensor(rgb_gt)
+            rgb_gt = rgb_gt.to(device, non_blocking=True)
+
+
+        optim.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=amp):
+            rgb_pred, _depth, _ = forward_batch(
+                model, rays, n_samples, near, far, perturb=True, bg_color=0.0, chunk=chunk, amp=amp
+            )
+            if rgb_gt is None:
+                raise KeyError("Training batch missing 'rgb' ground truth.")
+            loss = torch.mean((rgb_pred - rgb_gt) ** 2)
+
+        if scaler and amp:
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            optim.step()
+
+        if step % args.log_every == 0:
+            cur_psnr = float(psnr(loss).item())
+            print(f"[Train] step={step:06d} loss={loss.item():.6f} psnr={cur_psnr:.2f}")
+            run_log["iters"].append(step)
+            run_log["train_psnr"].append(cur_psnr)
+
+        if step % args.val_every == 0:
+            metrics = validate(model, val_loader, vars(args), device)
+            print(f"[Val] step={step:06d} psnr={metrics['val_psnr']:.2f}")
+            run_log["val_psnr"].append(metrics["val_psnr"])
+            with open(run_dir / "run_log.json", "w") as f:
+                json.dump(run_log, f, indent=2)
+
+        if step % args.snap_every == 0:
+            maybe_snapshot(model, step, vars(args), device, run_dir)
+
+        if step % args.ckpt_every == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "optim": optim.state_dict(),
+                "scaler": (scaler.state_dict() if (scaler and amp) else None),
+                "step": step,
+                "cfg": vars(args),
+            }, run_dir / "checkpoints" / f"step_{step:06d}.pt")
+
+    # final save
+    torch.save({"model": model.state_dict(), "cfg": vars(args)},
+               run_dir / "checkpoints" / "final.pt")
+    with open(run_dir / "run_log.json", "w") as f:
+        json.dump(run_log, f, indent=2)
+    print("[Done]")
+
+if __name__ == "__main__":
+    main()
