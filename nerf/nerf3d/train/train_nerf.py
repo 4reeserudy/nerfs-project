@@ -239,28 +239,46 @@ def main():
             batch = next(train_iter)
 
                 # ---- Normalize batch: accept nested {"rays":{"o","d"}} or flat {"rays_o","rays_d"} or {"o","d"} ----
+                # ---- Normalize batch to rays {"o","d"} + optional rgb ----
+        def _pick(d, keys):
+            for k in keys:
+                if k in d:
+                    return d[k]
+            return None
+
         def _extract_rays_rgb(b):
+            # 1) Nested dict case: {"rays": {...}, "rgb": ...}
             if "rays" in b and isinstance(b["rays"], dict):
-                ro = b["rays"].get("o") or b["rays"].get("origins")
-                rd = b["rays"].get("d") or b["rays"].get("dirs")
-                rgb = b.get("rgb", None)
+                ro = _pick(b["rays"], ["o", "origins", "rays_o"])
+                rd = _pick(b["rays"], ["d", "dirs", "rays_d"])
+                rgb = _pick(b, ["rgb", "colors", "target"])
                 if ro is not None and rd is not None:
                     return ro, rd, rgb
-            if "rays_o" in b and "rays_d" in b:
-                return b["rays_o"], b["rays_d"], b.get("rgb", None)
-            if "o" in b and "d" in b:
-                return b["o"], b["d"], b.get("rgb", None)
+
+            # 2) Flat cases: {"o","d","rgb"} OR {"origins","dirs","rgb"} OR {"rays_o","rays_d","rgb"}
+            ro = _pick(b, ["o", "origins", "rays_o"])
+            rd = _pick(b, ["d", "dirs", "rays_d"])
+            rgb = _pick(b, ["rgb", "colors", "target"])
+            if ro is not None and rd is not None:
+                return ro, rd, rgb
+
+            # If we get here, we didn't recognize the structure
             raise KeyError(f"Unrecognized batch format. Keys: {list(b.keys())}")
 
+        # --- use the normalizer
         rays_o, rays_d, rgb_gt = _extract_rays_rgb(batch)
 
         # Move to device
+        if not torch.is_tensor(rays_o): rays_o = torch.as_tensor(rays_o)
+        if not torch.is_tensor(rays_d): rays_d = torch.as_tensor(rays_d)
         rays = {
             "o": rays_o.to(device, non_blocking=True),
             "d": rays_d.to(device, non_blocking=True),
         }
-        if rgb_gt is not None and torch.is_tensor(rgb_gt):
+        if rgb_gt is not None:
+            if not torch.is_tensor(rgb_gt): rgb_gt = torch.as_tensor(rgb_gt)
             rgb_gt = rgb_gt.to(device, non_blocking=True)
+
 
         optim.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp):
