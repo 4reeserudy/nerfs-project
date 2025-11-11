@@ -12,6 +12,7 @@ from nerf.nerf3d.data.dataloader import make_loaders, seed_everything
 from nerf.nerf3d.models.main_model import NeRFMLP
 from nerf.nerf3d.engine.step import forward_batch
 from nerf.nerf3d.data.losses import psnr
+from nerf.nerf3d.rays.ray_sampler import pixels_to_rays_batched
 
 # ------------------------------- setup ---------------------------------
 
@@ -44,13 +45,27 @@ def setup_model_and_optim(cfg: Dict[str, Any]) -> Tuple[NeRFMLP, Adam, torch.cud
 
 # --------------------------- snapshot anchor ---------------------------
 
-def _pixels_to_rays_anchor(pix: torch.Tensor, K: np.ndarray, c2w: np.ndarray, device: torch.device):
-    # pix: (N,2) tensor (already on CPU is fine)
-    Kt   = torch.from_numpy(K).to(device=device, dtype=torch.float32)       # (3,3)
-    c2wt = torch.from_numpy(c2w).to(device=device, dtype=torch.float32)     # (4,4)
-    pix  = pix.to(device=device, dtype=torch.float32)                        # (N,2)
-    # Let pixels_to_rays_batched broadcast K/c2w to N
-    rays_o, rays_d = pixels_to_rays_batched(pix, Kt, c2wt, pixel_center=True)
+def _to_np_f32(x):
+    # Accept list/tuple/np/tensor; return np.float32
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+def _pixels_to_rays_anchor(pix: torch.Tensor, K, c2w, device: torch.device):
+    """
+    pix: (N,2) torch tensor
+    K:   (3,3) list/np/tensor  -> coerced to np.float32
+    c2w: (4,4) list/np/tensor  -> coerced to np.float32
+    """
+    K_np   = _to_np_f32(K)     # (3,3)
+    c2w_np = _to_np_f32(c2w)   # (4,4)
+
+    Kt   = torch.from_numpy(K_np).to(device=device, dtype=torch.float32)      # (3,3)
+    c2wt = torch.from_numpy(c2w_np).to(device=device, dtype=torch.float32)    # (4,4)
+    pixt = pix.to(device=device, dtype=torch.float32)                          # (N,2)
+
+    # Let pixels_to_rays_batched broadcast single K/c2w to all pixels
+    rays_o, rays_d = pixels_to_rays_batched(pixt, Kt, c2wt, pixel_center=True)
     return {"rays_o": rays_o, "rays_d": rays_d}
 
 def create_snapshot_anchor(scene: Dict[str, Any], run_dir: Path, device: torch.device, snap_stride: int = 2):
