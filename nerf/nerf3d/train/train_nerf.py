@@ -52,20 +52,25 @@ def _to_np_f32(x):
         x = x.detach().cpu().numpy()
     return np.asarray(x, dtype=np.float32)
 
-def _pixels_to_rays_anchor(pix: torch.Tensor, K, c2w, device: torch.device):
+def _pixels_to_rays_anchor(pix, K, c2w, device: torch.device):
     """
-    pix: (N,2) torch tensor
-    K:   (3,3) list/np/tensor  -> coerced to np.float32
-    c2w: (4,4) list/np/tensor  -> coerced to np.float32
+    pix: (N,2) pixels as np.ndarray / list / torch.Tensor
+    K:   (3,3) intrinsics
+    c2w: (4,4) camera-to-world
+    Returns dict {rays_o, rays_d} on `device`.
     """
-    K_np   = _to_np_f32(K)     # (3,3)
-    c2w_np = _to_np_f32(c2w)   # (4,4)
+    # Coerce everything to torch on the correct device/dtype
+    pixt = torch.as_tensor(pix, dtype=torch.float32, device=device)           # (N,2)
+    Kt   = torch.as_tensor(K,   dtype=torch.float32, device=device)           # (3,3) or (1,3,3)
+    c2wt = torch.as_tensor(c2w, dtype=torch.float32, device=device)           # (4,4)
 
-    Kt   = torch.from_numpy(K_np).to(device=device, dtype=torch.float32)      # (3,3)
-    c2wt = torch.from_numpy(c2w_np).to(device=device, dtype=torch.float32)    # (4,4)
-    pixt = pix.to(device=device, dtype=torch.float32)                          # (N,2)
+    # Squeeze optional leading dim (e.g., Ks shaped (1,3,3))
+    if Kt.ndim == 3 and Kt.shape[0] == 1:
+        Kt = Kt[0]
+    # Safety reshapes
+    Kt   = Kt.reshape(3, 3)
+    c2wt = c2wt.reshape(4, 4)
 
-    # Let pixels_to_rays_batched broadcast single K/c2w to all pixels
     rays_o, rays_d = pixels_to_rays_batched(pixt, Kt, c2wt, pixel_center=True)
     return {"rays_o": rays_o, "rays_d": rays_d}
 
