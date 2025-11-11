@@ -44,12 +44,14 @@ def setup_model_and_optim(cfg: Dict[str, Any]) -> Tuple[NeRFMLP, Adam, torch.cud
 
 # --------------------------- snapshot anchor ---------------------------
 
-def _pixels_to_rays_anchor(pixels_xy_hw, K, c2w, device):
-    from nerf.nerf3d.rays.ray_sampler import pixels_to_rays_batched
-    pix = torch.tensor(pixels_xy_hw, dtype=torch.float32, device=device)  # (N,2)
-    Kt = torch.tensor(K, dtype=torch.float32, device=device)
-    c2wt = torch.tensor(c2w, dtype=torch.float32, device=device)
-    return pixels_to_rays_batched(pix, Kt, c2wt)
+def _pixels_to_rays_anchor(pix: torch.Tensor, K: np.ndarray, c2w: np.ndarray, device: torch.device):
+    # pix: (N,2) tensor (already on CPU is fine)
+    Kt   = torch.from_numpy(K).to(device=device, dtype=torch.float32)       # (3,3)
+    c2wt = torch.from_numpy(c2w).to(device=device, dtype=torch.float32)     # (4,4)
+    pix  = pix.to(device=device, dtype=torch.float32)                        # (N,2)
+    # Let pixels_to_rays_batched broadcast K/c2w to N
+    rays_o, rays_d = pixels_to_rays_batched(pix, Kt, c2wt, pixel_center=True)
+    return {"rays_o": rays_o, "rays_d": rays_d}
 
 def create_snapshot_anchor(scene: Dict[str, Any], run_dir: Path, device: torch.device, snap_stride: int = 2):
     img = scene["images_val"][0]   # (H,W,3) float

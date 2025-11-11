@@ -247,52 +247,67 @@ def gather_rgb(scene: Scene, img_idx: torch.Tensor, uv: torch.Tensor) -> torch.T
     return rgb
 
 
+@torch.no_grad()
 def pixels_to_rays_batched(
-    Ks: torch.Tensor,          # (N,3,3) or (1,3,3) broadcastable
-    c2ws: torch.Tensor,        # (N,4,4)
-    uv: torch.Tensor,          # (N,2) float32; if pixel_center applied upstream, use as-is
-    pixel_center: bool = True, # if True and uv are integer-like, add +0.5 to center
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    pixels: torch.Tensor,   # (N, 2) integer/float pixels [u, v]
+    Ks: torch.Tensor,       # (3,3) or (N,3,3)
+    c2ws: torch.Tensor,     # (4,4) or (N,4,4)
+    pixel_center: bool = True,
+):
     """
-    Convert pixel coords to world-space ray origins & directions.
-
+    Convert a batch of pixels into rays (origins, directions).
+    Accepts single K/c2w or per-ray K/c2w; broadcasts if needed.
     Returns:
-        origins: (N,3)
-        dirs:    (N,3) unit vectors
+        rays_o: (N, 3)
+        rays_d: (N, 3) normalized
     """
-    if Ks.ndim == 2:  # (3,3) shared
-        Ks = Ks.unsqueeze(0).expand(uv.shape[0], -1, -1)
-    elif Ks.shape[0] == 1:  # (1,3,3) shared
-        Ks = Ks.expand(uv.shape[0], -1, -1)
+    # ---- validate pixels ----
+    if pixels.ndim != 2 or pixels.shape[-1] != 2:
+        raise ValueError(f"`pixels` must be (N,2), got {tuple(pixels.shape)}")
+    N = pixels.shape[0]
+    dtype = pixels.dtype
+    device = pixels.device
 
-    if pixel_center:
-        # Add 0.5 only if inputs look integer-ish
-        if not uv.dtype.is_floating_point or torch.allclose(uv, uv.floor()):
-            uv = uv.to(dtype=Ks.dtype) + 0.5
-        else:
-            uv = uv.to(dtype=Ks.dtype)
+    # ---- coerce & broadcast Ks ----
+    Ks = torch.as_tensor(Ks, dtype=dtype, device=device)
+    if Ks.ndim == 2 and Ks.shape == (3, 3):
+        Ks = Ks.unsqueeze(0).expand(N, -1, -1)         # (N,3,3)
+    elif Ks.ndim == 3 and (Ks.shape[0] == 1 or Ks.shape[0] == N) and Ks.shape[1:] == (3, 3):
+        Ks = Ks.expand(N, -1, -1)                      # (N,3,3)
     else:
-        uv = uv.to(dtype=Ks.dtype)
+        raise ValueError(f"`Ks` must be (3,3) or (N,3,3), got {tuple(Ks.shape)}")
 
-    device = Ks.device
-    uv = uv.to(device)
-    c2ws = c2ws.to(device)
+    # ---- coerce & broadcast c2ws ----
+    c2ws = torch.as_tensor(c2ws, dtype=dtype, device=device)
+    if c2ws.ndim == 2 and c2ws.shape == (4, 4):
+        c2ws = c2ws.unsqueeze(0).expand(N, -1, -1)     # (N,4,4)
+    elif c2ws.ndim == 3 and (c2ws.shape[0] == 1 or c2ws.shape[0] == N) and c2ws.shape[1:] == (4, 4):
+        c2ws = c2ws.expand(N, -1, -1)                  # (N,4,4)
+    else:
+        raise ValueError(f"`c2ws` must be (4,4) or (N,4,4), got {tuple(c2ws.shape)}")
 
-    ones = torch.ones((uv.shape[0], 1), device=device, dtype=Ks.dtype)
-    pix_h = torch.cat([uv, ones], dim=-1).unsqueeze(-1)      # (N,3,1)
+    # ---- pixel centers ----
+    if pixel_center:
+        pixels = pixels + 0.5
 
+    # ---- backproject to camera directions ----
+    ones = torch.ones((N, 1), dtype=dtype, device=device)
+    uv1 = torch.cat([pixels, ones], dim=-1).unsqueeze(-1)     # (N,3,1)
     Kinv = torch.linalg.inv(Ks)                               # (N,3,3)
-    d_c = (Kinv @ pix_h).squeeze(-1)                          # (N,3)
-    d_c = F.normalize(d_c, dim=-1)
+    dirs_cam = (Kinv @ uv1).squeeze(-1)                       # (N,3)
 
+    # normalize directions in camera space
+    dirs_cam = dirs_cam / torch.linalg.norm(dirs_cam, dim=-1, keepdim=True).clamp_min(1e-8)
+
+    # ---- transform to world space ----
     R = c2ws[:, :3, :3]                                       # (N,3,3)
     t = c2ws[:, :3, 3]                                        # (N,3)
+    rays_d = (R @ dirs_cam.unsqueeze(-1)).squeeze(-1)         # (N,3)
+    rays_o = t                                                # (N,3)
 
-    d_w = (R @ d_c.unsqueeze(-1)).squeeze(-1)                 # (N,3)
-    d_w = F.normalize(d_w, dim=-1)
-
-    o_w = t                                                   # (N,3)
-    return o_w, d_w
+    # normalize final dirs (optional but common)
+    rays_d = rays_d / torch.linalg.norm(rays_d, dim=-1, keepdim=True).clamp_min(1e-8)
+    return rays_o, rays_d
 
 # -----------------------------------------------------------------------------
 # PyTorch Dataset wrapper (optional; works locally and on Colab)

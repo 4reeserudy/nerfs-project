@@ -1,0 +1,29 @@
+{
+  "dataset": "data/nerf3d/lego/lego_200x200.npz",
+  "save_dir": "results/nerf3d",
+  "tag": "smoke",
+  "L_xyz": 10,
+  "L_dir": 4,
+  "W": 256,
+  "n_samples": 32,
+  "near": 2.0,
+  "far": 6.0,
+  "chunk": 8192,
+  "iters": 500,
+  "batch_size": 2048,
+  "lr": 0.0005,
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "weight_decay": 0.0,
+  "amp": false,
+  "device": "cpu",
+  "seed": 42,
+  "log_every": 50,
+  "val_every": 250,
+  "snap_every": 250,
+  "ckpt_every": 500,
+  "snap_stride": 4,
+  "resume": null
+}
