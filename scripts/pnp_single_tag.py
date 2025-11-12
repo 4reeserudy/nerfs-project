@@ -41,7 +41,7 @@ def load_calibration(calib_json: Path) -> CameraCalib:
 
 def tag_object_corners_mm(spec: TagSpec) -> np.ndarray:
     s = float(spec.size_mm) / 2.0
-    # TL, TR, BR, BL on z=0 (row-major image convention: +x right, +y down)
+    # TL, TR, BR, BL on z=0
     return np.array([[-s, -s, 0.0],
                      [ s, -s, 0.0],
                      [ s,  s, 0.0],
@@ -61,7 +61,6 @@ def undistort_and_detect(
     corners_list, ids, _ = cv2.aruco.detectMarkers(undist, aruco_dict, parameters=aruco_params)
     if ids is None:
         raise RuntimeError("No ArUco markers detected.")
-    # find the desired id
     ids_flat = ids.flatten()
     matches = np.where(ids_flat == int(target_id))[0]
     if len(matches) == 0:
@@ -75,7 +74,6 @@ def pnp_solve_and_error(
     object_corners_mm: np.ndarray,    # (4,3)
     K_new: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    # Use EPNP then refine; undistorted => dist=None
     ok, rvec, tvec = cv2.solvePnP(object_corners_mm, corners_2d, K_new, None,
                                   flags=cv2.SOLVEPNP_EPNP)
     if not ok:
@@ -83,7 +81,7 @@ def pnp_solve_and_error(
     try:
         rvec, tvec = cv2.solvePnPRefineLM(object_corners_mm, corners_2d, K_new, None, rvec, tvec)
     except Exception:
-        pass  # if refine unavailable, keep EPNP result
+        pass
     R, _ = cv2.Rodrigues(rvec)
     proj, _ = cv2.projectPoints(object_corners_mm, rvec, tvec, K_new, None)
     proj = proj.reshape(-1, 2)
@@ -100,7 +98,7 @@ def build_and_save_json(
         return x.tolist() if isinstance(x, np.ndarray) else x
     payload = {
         "K_new": tolist(K_new.astype(float)),
-        "dist": [0.0, 0.0, 0.0, 0.0, 0.0],  # undistorted workflow => zero
+        "dist": [0.0, 0.0, 0.0, 0.0, 0.0],  # undistorted output model
         "tag_spec": asdict(tag_spec),
         "frames": [
             {
@@ -125,7 +123,6 @@ def pnp_from_single_tag(
 ) -> None:
     calib = load_calibration(calib_json)
     obj_corners = tag_object_corners_mm(tag_spec)
-    # numeric sort: 1.jpg, 2.jpg, ...
     paths = sorted([p for p in images_dir.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}],
                    key=lambda p: (p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else p.stem))
     if not paths:
@@ -144,7 +141,6 @@ def pnp_from_single_tag(
             if (max_err_px is None) or (err <= max_err_px):
                 frames.append(PoseEntry(file=p.name, reproj_err_px=err, R=R, t=t))
         except RuntimeError:
-            # skip image if detection/PnP fails
             continue
     if not frames:
         raise RuntimeError("No valid poses computed.")
@@ -153,12 +149,15 @@ def pnp_from_single_tag(
 # ---------- CLI ----------
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="PnP poses from a single ArUco tag per image (undistort -> detect -> PnP).")
-    ap.add_argument("--images_dir", type=Path, required=True, help="Folder with object_3d images")
-    ap.add_argument("--calib_json", type=Path, required=True, help="camera_calib_result.json from phase 1")
-    ap.add_argument("--out", type=Path, required=True, help="Output poses JSON path (e.g., data/object_3d/results/poses_pnp.json)")
-    ap.add_argument("--tag_id", type=int, default=9)
-    ap.add_argument("--tag_size_mm", type=float, default=98.0)
+    ap = argparse.ArgumentParser(description="PnP poses from a single ArUco tag per image (bird dataset).")
+    ap.add_argument("--images_dir", type=Path, default=Path("data/bird/images_raw"),
+                    help="Folder with bird object images (400x300)")
+    ap.add_argument("--calib_json", type=Path, default=Path("data/bird/intrinsics/camera_calib.json"),
+                    help="Intrinsics JSON produced by calibrate_camera.py")
+    ap.add_argument("--out", type=Path, default=Path("data/bird/results/poses_pnp.json"),
+                    help="Output poses JSON")
+    ap.add_argument("--tag_id", type=int, default=0, help="Your tag ID in the frame")
+    ap.add_argument("--tag_size_mm", type=float, default=40.0, help="Marker size (edge length) in mm")
     ap.add_argument("--dict", type=str, default="DICT_4X4_50")
     ap.add_argument("--max_err_px", type=float, default=None)
     return ap.parse_args()
