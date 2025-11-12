@@ -1,7 +1,6 @@
 # nerf/nerf3d/data/dataloader.py
 from __future__ import annotations
 from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass
 import torch
 import random
 import os
@@ -188,7 +187,7 @@ def make_scene_from_npz(
     c2ws_t   = torch.from_numpy(c2ws_np).contiguous()     # (M,4,4)
     Ks_t     = torch.from_numpy(Ks_np).contiguous()       # (1,3,3) or (M,3,3)
 
-    # If K is shared (1,3,3), expand to per-image (M,3,3) for safe indexing
+    # Expand shared K to per-image for safe indexing (and downstream .index_select)
     if Ks_t.ndim == 3 and Ks_t.shape[0] == 1:
         Ks_t = Ks_t.expand(images_t.shape[0], -1, -1).contiguous()
 
@@ -258,10 +257,25 @@ def make_loader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
 ) -> torch.utils.data.DataLoader:
-    """Torch DataLoader for an IterableDataset that already yields full batches."""
+    """
+    Torch DataLoader for an IterableDataset that already yields full batches.
+
+    If the dataset/sampler emits CUDA tensors, disable pin_memory because
+    pinning applies only to CPU tensors.
+    """
+    # Auto-disable pin_memory if dataset advertises a CUDA device
+    try:
+        ds_dev = getattr(dataset, "device", None)
+        if ds_dev is None and hasattr(dataset, "sampler"):
+            ds_dev = getattr(dataset.sampler, "device", None)
+        if ds_dev is not None and torch.device(ds_dev).type == "cuda":
+            pin_memory = False
+    except Exception:
+        pass
+
     kwargs = dict(
         dataset=dataset,
-        batch_size=None,
+        batch_size=None,                     # RaysDataset yields ready-made batches
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
@@ -272,7 +286,7 @@ def make_loader(
 
 
 # -----------------------------------------------------------------------------
-# Utilities / entrypoint
+# Utilities / entrypoint helpers
 # -----------------------------------------------------------------------------
 
 def seed_everything(seed: Optional[int]) -> None:
@@ -285,6 +299,7 @@ def seed_everything(seed: Optional[int]) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Determinism knobs (OK for prototyping)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -325,6 +340,9 @@ def make_loaders(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # If training on CUDA and dataset yields CUDA tensors, pin_memory must be False.
+    pin_memory = bool(pin_memory and (device.type == "cpu"))
+
     # --- TRAIN ---
     train_scene, _train_meta = make_scene_from_npz(
         npz_path=npz_path, split="train", near=near, far=far)
@@ -352,10 +370,11 @@ def make_loaders(
     # Optional scene bundle for consistent snapshots
     scene_bundle = None
     if return_scene:
+        # Access via attributes expected by your Scene type
         scene_bundle = {
-            "images_val": val_scene.images,   # attr access (Scene object)
-            "c2ws_val":  val_scene.c2ws,
-            "focal":     float(_val_meta["focal"]),  # from meta
+            "images_val": val_scene.images,   # (Nv,H,W,3) float32 in [0,1]
+            "c2ws_val":  val_scene.c2ws,      # (Nv,4,4)
+            "focal":     float(_val_meta["focal"]),
         }
 
     return train_loader, val_loader, scene_bundle

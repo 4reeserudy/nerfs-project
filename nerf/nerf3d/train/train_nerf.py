@@ -241,13 +241,15 @@ def main():
     print(f"[Device] {device}")
 
     # loaders (pin only on CPU; on CUDA our dataset already yields GPU tensors)
+    # loaders
     train_loader, val_loader, scene = make_loaders(
         args.dataset,
         batch_size=args.batch_size,
         device=device,
-        pin_memory=(device.type == "cpu"),
-        return_scene=True,
+        pin_memory=(device.type == "cpu"),   # <-- key change
+        return_scene=True
     )
+
 
     # run dir + anchor
     run_dir = setup_run(args)
