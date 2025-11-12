@@ -105,26 +105,41 @@ def maybe_snapshot(model, step: int, cfg: Dict[str, Any], device: torch.device, 
     rays, meta = load_snapshot_anchor(run_dir, device)
     n = rays["o"].shape[0]
     chunk = int(cfg.get("chunk", 8192))
-    near, far = float(cfg.get("near",2.0)), float(cfg.get("far",6.0))
-    n_samples = int(cfg.get("n_samples",64))
+    near, far = float(cfg.get("near", 2.0)), float(cfg.get("far", 6.0))
+    n_samples = int(cfg.get("n_samples", 64))
     amp = bool(cfg.get("amp", False)) and device.type == "cuda"
 
-    outs = []
+    rgb_outs, acc_outs = [], []
     for s in range(0, n, chunk):
         sub = {"o": rays["o"][s:s+chunk], "d": rays["d"][s:s+chunk]}
         with torch.cuda.amp.autocast(enabled=amp):
-            rgb, _depth, _ = forward_batch(model, sub, n_samples, near, far,
-                                           perturb=False, bg_color=0.0, chunk=chunk, amp=amp)
-        outs.append(rgb.detach().cpu())
-    rgb_all = torch.cat(outs, dim=0).clamp(0,1)
+            rgb, _depth, extras = forward_batch(
+                model, sub, n_samples, near, far,
+                perturb=False, bg_color=0.0, chunk=chunk, amp=amp
+            )
+        rgb_outs.append(rgb.detach().cpu())
+        acc_outs.append(extras["acc"].detach().cpu())
+
+    rgb_all = torch.cat(rgb_outs, dim=0).clamp(0, 1)     # (rh*rw,3)
+    acc_all = torch.cat(acc_outs, dim=0).clamp(0, 1)     # (rh*rw,)
 
     H, W, stride = int(meta["H"]), int(meta["W"]), int(meta["stride"])
     rh, rw = (H + stride - 1)//stride, (W + stride - 1)//stride
-    img = (rgb_all.view(rh, rw, 3).mul(255).byte().numpy())
-    im = Image.fromarray(img, mode="RGB")
+
+    img_rgb = (rgb_all.view(rh, rw, 3).mul(255).byte().numpy())
+    img_acc = (acc_all.view(rh, rw).mul(255).byte().numpy())
+
+    im = Image.fromarray(img_rgb, mode="RGB")
+    im_acc = Image.fromarray(img_acc, mode="L")
     if stride > 1:
         im = im.resize((W, H), Image.NEAREST)
-    im.save(run_dir / "snaps" / f"step_{step:06d}.png")
+        im_acc = im_acc.resize((W, H), Image.NEAREST)
+
+    out_png = run_dir / "snaps" / f"step_{step:06d}.png"
+    out_acc = run_dir / "snaps" / f"step_{step:06d}_acc.png"
+    im.save(out_png)
+    im_acc.save(out_acc)
+
 
 # ------------------------------ validate --------------------------------
 
