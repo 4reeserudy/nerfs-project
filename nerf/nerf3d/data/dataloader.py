@@ -147,7 +147,7 @@ def make_scene_from_npz(
 
     images_np = normalize_images_to_float(raw[img_key])      # (M,H,W,3)
     c2ws_np   = raw[c2w_key].astype(np.float32)              # (M,4,4)
-    c2ws_np   = ensure_c2w_opengl(c2ws_np)                   # toggle if needed
+    # c2ws_np   = ensure_c2w_opengl(c2ws_np)                   # toggle if needed
 
     M, H, W, _ = images_np.shape
 
