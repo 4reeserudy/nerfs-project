@@ -1,86 +1,33 @@
 # scripts/visualize_poses_viser.py
 from __future__ import annotations
 import argparse
-import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Optional, Tuple
 
 import numpy as np
-import cv2
 import viser
-
-
-# ---------- I/O ----------
-
-def load_poses_json(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text())
-    if "K_new" not in data or "frames" not in data:
-        raise ValueError("poses JSON must contain 'K_new' and 'frames'.")
-    return data
-
-
-def image_size_for(path: Path) -> Tuple[int, int]:
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Failed to read image: {path}")
-    h, w = img.shape[:2]
-    return (w, h)
-
-
-def load_image_rgb(path: Path, max_long_edge: Optional[int] = 1280) -> Optional[np.ndarray]:
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if max_long_edge is not None:
-        h, w = img.shape[:2]
-        long_edge = max(h, w)
-        if long_edge > max_long_edge:
-            scale = max_long_edge / float(long_edge)
-            img = cv2.resize(img, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA)
-    return img
 
 
 # ---------- Math helpers ----------
 
-def rt_to_c2w(R: np.ndarray, t: np.ndarray, mm_to_m: bool = True) -> np.ndarray:
-    """
-    OpenCV gives T_cw = [R|t] (world->camera).
-    We need camera->world (T_wc):
-      T_wc = [[R^T | -R^T @ t],
-              [0 0 0 1]]
-    """
-    R = np.asarray(R, dtype=np.float64)
-    t = np.asarray(t, dtype=np.float64).reshape(3, 1)
-    Rt = R.T
-    tw = -Rt @ t
-    if mm_to_m:
-        tw = tw * 1e-3
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = Rt
-    T[:3, 3:4] = tw
-    return T
-
-
 def align_to_y_up(c2w: np.ndarray) -> np.ndarray:
     """
-    Convert CV convention (x right, y down, z out) to y-up.
-    Apply Rx(pi): diag(1, -1, -1).
+    Convert CV convention (x right, y down, z forward) to a y-up world.
+    Applies Rx(pi): diag(1, -1, -1) to both rotation and translation.
     """
     R_align = np.array([[1.0, 0.0, 0.0],
                         [0.0, -1.0, 0.0],
                         [0.0, 0.0, -1.0]], dtype=np.float64)
     out = c2w.copy()
     out[:3, :3] = R_align @ c2w[:3, :3]
-    out[:3, 3]   = (R_align @ c2w[:3, 3])
+    out[:3, 3] = R_align @ c2w[:3, 3]
     return out
 
 
-def intrinsics_to_fov_aspect(K: np.ndarray, W: int, H: int) -> Tuple[float, float]:
-    K = np.asarray(K, dtype=np.float64)
-    fx = float(K[0, 0])
-    fov_x = 2.0 * np.arctan2(W / 2.0, fx)
+def intrinsics_from_focal(focal: float, W: int, H: int) -> Tuple[float, float]:
+    """Return (fov_x, aspect) given scalar focal and image size."""
+    fov_x = 2.0 * np.arctan2(W / 2.0, focal)
     aspect = float(W) / float(H)
     return fov_x, aspect
 
@@ -95,7 +42,7 @@ def add_camera_frustum(
     aspect: float,
     scale: float,
     image_rgb: Optional[np.ndarray] = None,
-    color: Tuple[float, float, float] = (1.0, 1.0, 1.0),  # white frames
+    color: Tuple[float, float, float] = (1.0, 1.0, 1.0),  # white frusta
 ) -> None:
     R = c2w[:3, :3]
     t = c2w[:3, 3]
@@ -114,60 +61,111 @@ def add_camera_frustum(
 
 # ---------- Orchestrator ----------
 
-def visualize_poses_viser(
-    poses_json: Path,
-    images_dir: Path,
+def visualize_npz_viser(
+    npz_path: Path,
+    split: str = "all",                 # "train" | "val" | "test" | "all"
     scale_frustum: float = 0.02,
     share: bool = True,
-    max_long_edge: Optional[int] = 1280,
+    up_axis: str = "y",                 # "y" (y-up) or "cv" (no flip)
+    bg: str = "black",                  # "black" | "white"
 ) -> None:
-    data = load_poses_json(poses_json)
-    K_new = np.array(data["K_new"], dtype=np.float64)
-    frames = data["frames"]
+    data = np.load(str(npz_path))
 
-    # Determine image size from the first available frame
+    # Pull arrays (handle absence gracefully)
+    images_train = data.get("images_train")
+    images_val   = data.get("images_val")
+    c2ws_train   = data.get("c2ws_train")
+    c2ws_val     = data.get("c2ws_val")
+    c2ws_test    = data.get("c2ws_test")
+    focal        = float(data["focal"]) if "focal" in data else None
+
+    # Determine a reference image size (prefer train, then val)
     W = H = None
-    for f in frames:
-        ipath = images_dir / f["file"]
-        if ipath.exists():
-            W, H = image_size_for(ipath)
-            break
-    if W is None or H is None:
-        raise FileNotFoundError("Could not infer image size; none of the listed images were found.")
+    ref_images = None
+    if images_train is not None and len(images_train) > 0:
+        ref_images = images_train
+    elif images_val is not None and len(images_val) > 0:
+        ref_images = images_val
 
-    fov_x, aspect = intrinsics_to_fov_aspect(K_new, W, H)
+    if ref_images is not None and ref_images.size > 0:
+        H, W = int(ref_images.shape[1]), int(ref_images.shape[2])
 
-    server = viser.ViserServer(share=share)
-    # Try to make background black / dark theme (best-effort).
-    try:
-        server.gui.configure_theme(dark=True)
-    except Exception:
-        pass
-    try:
-        server.scene.set_background_color((0.0, 0.0, 0.0))
-    except Exception:
-        pass
-
-    # Add all camera frusta
-    for f in frames:
-        R = np.array(f["R"], dtype=np.float64)
-        t = np.array(f["t"], dtype=np.float64)
-        c2w = rt_to_c2w(R, t, mm_to_m=True)
-        c2w = align_to_y_up(c2w)
-
-        ipath = images_dir / f["file"]
-        img_rgb = load_image_rgb(ipath, max_long_edge=max_long_edge) if ipath.exists() else None
-
-        add_camera_frustum(
-            server,
-            name=f"/cameras/{Path(f['file']).stem}",
-            c2w=c2w,
-            fov_x=fov_x,
-            aspect=aspect,
-            scale=scale_frustum,
-            image_rgb=img_rgb,
-            color=(1.0, 1.0, 1.0),
+    if focal is None or W is None or H is None:
+        raise ValueError(
+            "Could not infer focal or image size from NPZ. "
+            "Make sure your NPZ contains 'focal' and at least one of images_train/images_val."
         )
+
+    fov_x, aspect = intrinsics_from_focal(focal, W, H)
+
+    # Start viser server
+    server = viser.ViserServer(share=share)
+    try:
+        server.gui.configure_theme(dark=(bg == "black"))
+    except Exception:
+        pass
+    try:
+        server.scene.set_background_color((0.0, 0.0, 0.0) if bg == "black" else (1.0, 1.0, 1.0))
+    except Exception:
+        pass
+
+    # Helper to optionally apply up-axis conversion
+    def maybe_align(c2w: np.ndarray) -> np.ndarray:
+        return align_to_y_up(c2w) if up_axis.lower() == "y" else c2w
+
+    # Add TRAIN frusta (+ images)
+    if split in ("train", "all"):
+        if c2ws_train is not None and len(c2ws_train) > 0:
+            n = len(c2ws_train)
+            for i in range(n):
+                img = None
+                if images_train is not None and len(images_train) > i:
+                    img = images_train[i]
+                add_camera_frustum(
+                    server,
+                    name=f"/train/{i:04d}",
+                    c2w=maybe_align(c2ws_train[i]),
+                    fov_x=fov_x,
+                    aspect=aspect,
+                    scale=scale_frustum,
+                    image_rgb=img,
+                    color=(1.0, 1.0, 1.0),
+                )
+
+    # Add VAL frusta (+ images)
+    if split in ("val", "all"):
+        if c2ws_val is not None and len(c2ws_val) > 0:
+            n = len(c2ws_val)
+            for i in range(n):
+                img = None
+                if images_val is not None and len(images_val) > i:
+                    img = images_val[i]
+                add_camera_frustum(
+                    server,
+                    name=f"/val/{i:04d}",
+                    c2w=maybe_align(c2ws_val[i]),
+                    fov_x=fov_x,
+                    aspect=aspect,
+                    scale=scale_frustum,
+                    image_rgb=img,
+                    color=(0.6, 0.9, 1.0),   # slight tint to distinguish from train
+                )
+
+    # Add TEST frusta (no images in v2)
+    if split in ("test", "all"):
+        if c2ws_test is not None and len(c2ws_test) > 0:
+            n = len(c2ws_test)
+            for i in range(n):
+                add_camera_frustum(
+                    server,
+                    name=f"/test/{i:04d}",
+                    c2w=maybe_align(c2ws_test[i]),
+                    fov_x=fov_x,
+                    aspect=aspect,
+                    scale=scale_frustum,
+                    image_rgb=None,
+                    color=(1.0, 0.6, 0.6),
+                )
 
     # Keep the server alive
     try:
@@ -180,26 +178,30 @@ def visualize_poses_viser(
 # ---------- CLI ----------
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Visualize PnP poses as camera frusta in Viser (y-up, white frusta, black bg).")
-    ap.add_argument("--poses_json", type=Path, required=True,
-                    help="e.g., data/object_3d/results/poses_pnp.json")
-    ap.add_argument("--images_dir", type=Path, required=True,
-                    help="e.g., data/object_3d/images")
+    ap = argparse.ArgumentParser(
+        description="Visualize NPZ (v2) cameras in Viser (y-up default, white frusta on black bg)."
+    )
+    ap.add_argument("--npz", type=Path, required=True, help="e.g., data/bird/bird_dataset_v2.npz")
+    ap.add_argument("--split", type=str, default="all",
+                    choices=["train", "val", "test", "all"],
+                    help="Which split(s) to draw.")
     ap.add_argument("--scale_frustum", type=float, default=0.02)
-    ap.add_argument("--no_share", action="store_true")
-    ap.add_argument("--max_long_edge", type=int, default=1280,
-                    help="Downscale images for faster streaming (None to disable).")
+    ap.add_argument("--no_share", action="store_true", help="Disable Viser sharing.")
+    ap.add_argument("--up_axis", type=str, default="y", choices=["y", "cv"],
+                    help="'y' applies CV->y-up flip; 'cv' leaves as-is.")
+    ap.add_argument("--bg", type=str, default="black", choices=["black", "white"])
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
-    visualize_poses_viser(
-        poses_json=args.poses_json,
-        images_dir=args.images_dir,
+    visualize_npz_viser(
+        npz_path=args.npz,
+        split=args.split,
         scale_frustum=args.scale_frustum,
         share=not args.no_share,
-        max_long_edge=args.max_long_edge,
+        up_axis=args.up_axis,
+        bg=args.bg,
     )
 
 

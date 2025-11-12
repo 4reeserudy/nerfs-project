@@ -32,7 +32,6 @@ class CalibResult:
 # ----------------- Core helpers -----------------
 
 def _dict_from_name(dict_name: str):
-    # e.g., "DICT_4X4_50" -> cv2.aruco.DICT_4X4_50
     key = dict_name if dict_name.startswith("DICT_") else f"DICT_{dict_name}"
     const = getattr(cv2.aruco, key)
     return cv2.aruco.getPredefinedDictionary(const)
@@ -43,7 +42,7 @@ def create_detector_and_layout(
 ) -> Tuple[object, object, Dict[int, np.ndarray]]:
     aruco_dict = _dict_from_name(dict_name)
     aruco_params = cv2.aruco.DetectorParameters()
-    # Precompute 3D corners per ID (row-major IDs: 0..rows*cols-1)
+
     half = spec.tag_size_mm / 2.0
     offsets = np.array([[-half, -half, 0.0],
                         [ half, -half, 0.0],
@@ -66,7 +65,6 @@ def process_image(
     corners, ids, _ = cv2.aruco.detectMarkers(image_bgr, aruco_dict, parameters=aruco_params)
     if ids is None or len(ids) < min_tags:
         return None
-    # Normalize: sort by ID asc; keep TL,TR,BR,BL order per tag
     order = np.argsort(ids.flatten())
     obj_list, img_list = [], []
     for idx in order:
@@ -88,11 +86,10 @@ def calibrate_and_evaluate(
     image_points: List[np.ndarray],
     image_size: Tuple[int, int]
 ) -> CalibResult:
-    flags = 0  # keep default; we want full estimation
+    flags = 0
     ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         object_points, image_points, image_size, None, None, flags=flags
     )
-    # Per-image reprojection error
     per_img_err = []
     for i, (obj_i, img_i) in enumerate(zip(object_points, image_points)):
         proj, _ = cv2.projectPoints(obj_i, rvecs[i], tvecs[i], K, dist)
@@ -135,10 +132,6 @@ def calibrate_camera(
     dict_name: str = "DICT_4X4_50",
     min_tags_per_image: int = 2
 ) -> CalibResult:
-    results_dir = images_dir.parent / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    out_path = results_dir / out_path.name  # always drop result into /results/
-
     image_paths = sorted(
         [p for p in images_dir.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}],
         key=lambda p: (p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else p.stem)
@@ -178,9 +171,11 @@ def calibrate_camera(
 # ----------------- CLI -----------------
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Calibrate camera using a 3x2 ArUco board.")
-    ap.add_argument("--images_dir", type=Path, required=True, help="Folder with images (e.g., 1.jpg..42.jpg)")
-    ap.add_argument("--out", type=Path, required=True, help="Output JSON path")
+    ap = argparse.ArgumentParser(description="Calibrate camera using a grid of ArUco tags.")
+    ap.add_argument("--images_dir", type=Path, default=Path("data/bird/calib_raw"),
+                    help="Folder with calibration photos (e.g., 1.jpg..N.jpg)")
+    ap.add_argument("--out", type=Path, default=Path("data/bird/intrinsics/camera_calib.json"),
+                    help="Output JSON for intrinsics/distortion")
     ap.add_argument("--rows", type=int, default=3)
     ap.add_argument("--cols", type=int, default=2)
     ap.add_argument("--tag_size_mm", type=float, default=60.0)
